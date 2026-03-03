@@ -23,24 +23,24 @@ from simtradelab.backtest.config import BacktestConfig
 
 
 if __name__ == '__main__':
-    # ==================== 回测配置 ====================
-
-    # 策略名称
-    strategy_name = '5mv'
-
-    # 回测周期
-    start_date = '2025-01-01'
-    end_date = '2025-10-31'
 
     # ==================== 启动回测 ====================
 
     # 创建配置
     config = BacktestConfig(
-        strategy_name=strategy_name,
-        start_date=start_date,
-        end_date=end_date,
-        initial_capital=100000.0
+    # strategy_name='my_strategy',
+    strategy_name='5mv',
+    start_date='2025-01-01',
+    end_date='2025-12-31',
+    initial_capital=1000000.0,  # 初始资金
+    frequency='1d',       # '1d' 日线回测（默认），'1m' 分钟回测
+    benchmark_code='000300.SS',  # 基准指数（默认沪深300）
+    enable_logging=True,  # 生成 .log 日志文件（默认开启）
+    enable_charts=True,   # 生成 .png 可视化图表（默认开启）
+    enable_export=True,  # 生成 .csv 每日统计和持仓快照（默认关闭）
+    sandbox=True,         # PTrade 兼容模式，限制 f-string 等语法（默认开启）
     )
+
 
     # 运行回测
     runner = BacktestRunner()
