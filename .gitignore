@@ -77,3 +77,4 @@ data*/
 .claude
 *.ipynb
 strategies/*/stats/*.csv
+.python-version
