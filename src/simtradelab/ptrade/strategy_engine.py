@@ -19,6 +19,8 @@ import logging
 import traceback
 from typing import Any, Callable, Optional
 
+from tqdm import tqdm
+
 from .context import Context
 
 # 策略代码禁止导入的模块（与Ptrade平台一致）
@@ -281,7 +283,7 @@ class StrategyExecutionEngine:
         # 跨日追踪：上一交易日收盘后的组合市值（用于计算真实日盈亏）
         prev_day_end_value = None
 
-        for current_date in date_range:
+        for current_date in tqdm(date_range, desc="回测进度", unit="日", leave=True):
             if self._cancel_event and self._cancel_event.is_set():
                 self.log.info("回测已取消")
                 return False
@@ -346,7 +348,7 @@ class StrategyExecutionEngine:
         # 跨日追踪：上一交易日收盘后的组合市值
         prev_day_end_value = None
 
-        for current_date in date_range:
+        for current_date in tqdm(date_range, desc="回测进度", unit="日", leave=True):
             if self._cancel_event and self._cancel_event.is_set():
                 self.log.info("回测已取消")
                 return False
