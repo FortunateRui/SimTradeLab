@@ -28,8 +28,8 @@ if __name__ == '__main__':
 
     # 创建配置
     config = BacktestConfig(
-    # strategy_name='my_strategy',
-    strategy_name='5mv',
+    strategy_name='my_strategy',
+    # strategy_name='5mv',
     start_date='2025-01-01',
     end_date='2025-12-31',
     initial_capital=1000000.0,  # 初始资金
