@@ -2,7 +2,7 @@
 
 迪马克指标由Thomas R DeMark 创建，已经有30年的历史。他的交易系统包含上百个指标，其中应用最广泛的是TD序列。该指标使用包含“准备”和“倒数”两部分指标的价格比较过程，该指标用于识别市场趋势或盘整过程中的潜在转折点。
 
-Demark Sequential包含三个主要部分：[**Set up**](#setuptd结构),[**Intersection**](#intersectiontd交叉) 和 [**Count down**](#countdowntd计数),下面均以 *买入信号* 为例进行说明，卖出信号则相反。
+Demark Sequential包含三个主要部分：[**Set up**](#setuptd结构) , [**Intersection**](#intersectiontd交叉) 和 [**Count down**](#countdowntd计数),下面均以 *买入信号* 为例进行说明，卖出信号则相反。
 
 
 
@@ -119,7 +119,7 @@ TD 终结计数中的变数n也可以被替换为其他值。
 > ***实际最高价*** :指当前K线的最高价与其前一根K线的收盘价两者之间较高的价格。  
 > 连续两个TD买入结构，前一个称为 ***TD买入结构1***；后一个称为 ***TD买入结构2***。  
 > TD买入结构的***真实波幅*** = 实际最高价 - 实际最低价  
-> 使用[完美countdown](#perfectcountdown)时，当TD买入计数达到12时，如果第13根K线只满足一般计数条件，但是不满足完美countdown的条件，那么这根K线就不能计数为13，在显示时只显示一个“+”。
+> 使用[完美countdown](#perfectcountdown)时，当TD买入计数达到12时，如果第13根K线只满足一般计数条件，但是不满足完美countdown的条件，那么这根K线就不能计数为13，在显示时只显示一个“+”。  
 > ***Recycle*** 意味着TD买入计数重新开始。其核心逻辑是：如果出现新的同方向更强的TD结构，则以新结构为准，如果不够强，则保留原计数，如果过于极端，也保留原结构。  
 
 ![TD Countdown](./images/TD_Countdown.jpeg)
