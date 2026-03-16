@@ -186,6 +186,8 @@ class BarsManager:
         size = self._size[key]
         key_bars = self.bars[key]
         key_time_index = self.time_index[key]
+        if bar.datetime in key_time_index:
+            log.error("datetime already exists when adding new data | security={}, frequency={}, datetime={}".format(bar.security, bar.frequency, bar.datetime))
         # 若已满，覆盖最旧位置并删除其 datetime 映射
         if size >= self.capacity:
             old_bar = key_bars[head]
