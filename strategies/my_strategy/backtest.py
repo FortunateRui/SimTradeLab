@@ -6,7 +6,10 @@
 """
 
 import pickle
+import pandas as pd
 RESEARCH_PATH = get_research_path()
+
+
 
 def initialize(context):
     
@@ -29,14 +32,28 @@ def initialize(context):
 
     # 运行时变量
     g.bars_manager = BarsManager(capacity=g.cache_capacity)  # 环形数组容量；(security, frequency) 在首次 add_new_data 时自动创建
-    
+    g.setup_machines_manager = {}  # 存储setup机器的dict，key为(security, frequency)，value为SetupMachine对象
 
 
 
     # 初始化
     fill_bars_manager(context)
 
-
+    # for security in g.securities:
+    #     _key = (security, g.frequency) 
+    #     g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
+    #     for offset in range(0, g.bars_manager.get_size(security, g.frequency)-1):
+    #         g.setup_machines_manager[_key].update_state(g.bars_manager.get_data_by_offset(security, g.frequency, g.bars_manager.get_oldest_datetime(security, g.frequency), offset).datetime)
+    for security in g.securities:
+        _key = (security, g.frequency) 
+        g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
+        size = g.bars_manager.get_size(security, g.frequency)
+        if size <= 0:
+            continue
+        start_datetime = g.bars_manager.get_oldest_datetime(security, g.frequency)
+        for offset in range(0, size-1):
+            bar = g.bars_manager.get_data_by_offset(security, g.frequency, start_datetime, offset)
+            g.setup_machines_manager[_key].update_state(bar.datetime)
 
     # TODO: 是否有需要持久化的数据？如果有，通过pickle进行持久化，init、handle、after_trading_end中都要有相关的持久化恢复和保存
 
@@ -88,12 +105,12 @@ class BarsManager:
     """
     说明：存储近 n 根股票 K 线数据的对象，使用环形数组 + 哈希表，避免 pop(0) 导致下标错位。
 
-    member:
-        capacity: int       # 缓存容量，即每个 (security, frequency) 最多存储 capacity 条最新数据
-        bars: dict          # (security, frequency) -> 环形数组 list[Bar|None]，固定长度 capacity
-        time_index: dict    # (security, frequency) -> { datetime -> 环形数组物理下标 }
-        _head: dict         # (security, frequency) -> 下一次写入的环形数组下标
-        _size: dict         # (security, frequency) -> 当前已存 Bar 数量
+    self.member:
+        self.capacity: int       # 缓存容量，即每个 (security, frequency) 最多存储 capacity 条最新数据
+        self.bars: dict          # (security, frequency) -> 环形数组 list[Bar|None]，固定长度 capacity
+        self.time_index: dict    # (security, frequency) -> { datetime -> 环形数组物理下标 }
+        self._head: dict         # (security, frequency) -> 下一次写入的环形数组下标
+        self._size: dict         # (security, frequency) -> 当前已存 Bar 数量
     """
     def __init__(self, capacity: int = 300):
         self.capacity = capacity
@@ -117,6 +134,42 @@ class BarsManager:
             self.time_index[key] = {}
             self._head[key] = 0
             self._size[key] = 0
+    
+    def get_size(self, security: str, frequency: str):
+        """
+        获取当前已存 Bar 数量
+        :param security: 股票代码
+        :param frequency: 频率周期
+        :return: 当前已存 Bar 数量
+        """
+        key = self._key(security, frequency)
+        return self._size.get(key, 0)
+    def get_latest_datetime(self, security: str, frequency: str):
+        """
+        获取最新日期时间
+        :param security: 股票代码
+        :param frequency: 频率周期
+        :return: 最新日期时间
+        """
+        key = self._key(security, frequency)
+        if key not in self.time_index:
+            log.error("time_index not found | security={}, frequency={}".format(security, frequency))
+            return None
+        return self.time_index[key][-1]
+       
+        
+    def get_oldest_datetime(self, security: str, frequency: str):
+        """
+        获取最旧日期时间
+        :param security: 股票代码
+        :param frequency: 频率周期
+        :return: 最旧日期时间
+        """
+        key = self._key(security, frequency)
+        if key not in self.time_index:
+            log.error("time_index not found | security={}, frequency={}".format(security, frequency))
+            return None
+        return self.time_index[key][0]
 
     def get_data_by_datetime(self, security: str, frequency: str, datetime: str):
         """
@@ -210,16 +263,18 @@ def fill_bars_manager(context):
     frequency = g.frequency
     securities = g.securities
 
-    if frequency in ['1d', '1w', '1mo', '1q', '1y', 'daily', 'weekly', 'monthly', 'quarter', 'yearly']:
-        end_date = context.blotter.current_dt.strftime("%Y%m%d")     # 日线及更高周期，日期格式为YYYYMMDD
-    else:
-        end_date = context.blotter.current_dt.strftime("%Y%m%d%H%M") # 分钟线格式为YYYYMMDDHHMM
+    # if frequency in ['1d']:
+    #     end_date = (context.blotter.current_dt - pd.Timedelta(days=1)).strftime("%Y%m%d")     # 日线及更高周期，日期格式为YYYYMMDD
+    # else:
+    #     end_date = (context.blotter.current_dt).strftime("%Y%m%d%H%M") # 分钟线格式为YYYYMMDDHHMM, -1天
+
     fields = ["open", "high", "low", "close", "volume", "money"]
-    count = int(g.cache_capacity * 1.5 + 0.9999)    # 向上取整，确保至少有1.5倍缓存容量的数据，避免因停牌等导致数据不足
+    _count = int(g.cache_capacity * 1.5 + 0.9999)    # 向上取整，确保至少有1.5倍缓存容量的数据，避免因停牌等导致数据不足
     for security in securities:
-        df = get_price(security, end_date, frequency, fields, count=count)
+
+        df = get_price(security=security, frequency=frequency, fields=fields, count=_count,fq="pre")
         if df is None or df.empty:
-            log.warning("get_price 返回空结果 | security={}, end_date={}, frequency={}, fields={}, count={}".format(security, end_date, frequency, fields, count))
+            log.warning("get_price 返回空结果 | security={}, frequency={}, fields={}, count={}".format(security, frequency, fields, _count))
             continue
         # df 是 pandas.DataFrame, 行索引为 datetime.datetime, 列索引为行情字段名(str)
         for dt, row in df.iterrows():
@@ -231,34 +286,25 @@ def fill_bars_manager(context):
 
 class SetupMachine: 
 
-    # 存储该状态机分析的股票信息，应该在初始化完成后就不再变化
-    security: str = None    # 股票代码
-    frequency: str = "1d"    # 数据频率
-
-    # 运行时维护的变量
-    last_datetime: str = None   # 记录当前状态对应的日期时间
-    sd:int = 0                  # 表示状态的变量1，实际含义是当前setup的方向，1代表买入setup，-1代表卖出setup，0代表没有方向
-    sc:int = 0                  # 表示状态的变量2，实际含义是当前setup的计数，0代表没有计数
-    setup_list: list[str] = []  # 存储当前的setup列表，每个元素为datetime字符串
-
     # 构造函数
     def __init__(self, security: str, frequency: str):
         assert security is not None and frequency is not None, "security and frequency must be set in SetupMachine"
         assert hasattr(g, "bars_manager"), "bars_manager must be set before initializing SetupMachine"
-        self.security = security
-        self.frequency = frequency
-        self.last_datetime = None
-        self.sd = 0
-        self.sc = 0
-        self.bm = g.bars_manager
+        self.security = security    # 股票代码
+        self.frequency = frequency  # 数据频率
+        self.last_datetime = None   # 记录当前状态对应的日期时间，初始化为None
+        self.sd = 0                 # 表示状态的变量1，实际含义是当前setup的方向，1代表买入setup，-1代表卖出setup，0代表没有方向，初始化为0
+        self.sc = 0                 # 表示状态的变量2，实际含义是当前setup的计数，0代表没有计数，初始化为0
+        self.setup_list = []        # 存储当前的setup列表，每个元素为datetime字符串，初始化为空列表
+        self.bm = g.bars_manager    # 存储股票K线数据的环形数组
 
-    def judge_input(datetime: str):
+    def judge_input(self, datetime: str):
         """
         判断输入信号
-        :param datetime: 日期时间
-        :return: 输入信号，BS代表买入信号，SS代表卖出信号，EQ代表等价信号
+        :param datetime: 日期时间（应按时间递增调用）
+        :return: 输入信号，BS代表买入结构方向，SS代表卖出结构方向，EQ代表无变化
         """
-        if datetime <= self.last_datetime:
+        if self.last_datetime is not None and datetime <= self.last_datetime:
             raise ValueError("datetime is less than last_datetime | datetime={}, last_datetime={}".format(datetime, self.last_datetime))
         bar = self.bm.get_data_by_datetime(self.security, self.frequency, datetime)
         bar_pre_4 = self.bm.get_data_by_offset(self.security, self.frequency, datetime, -4)
@@ -460,6 +506,7 @@ class SetupMachine:
                 if self.setup_list.__len__() != 9:
                     raise ValueError("setup_list length is not 9 | setup_list={},check setup machine logic".format(self.setup_list))
                 # TODO: 判断是否是完美setup，并输出Buy Setup或完美Buy Setup信号
+                print("Buy Setup | (security,frequency)=({},{}), setup_list={}".format(self.security, self.frequency, self.setup_list))
             case (1,0):
                 # q5状态
                 self.setup_list.clear()
@@ -476,6 +523,7 @@ class SetupMachine:
                 if self.setup_list.__len__() != 9:
                     raise ValueError("setup_list length is not 9 | setup_list={},check setup machine logic".format(self.setup_list))
                 # TODO: 判断是否是完美setup，并输出Sell Setup或完美Sell Setup信号
+                print("Sell Setup | (security,frequency)=({},{}), setup_list={}".format(self.security, self.frequency, self.setup_list))
             case _:
                 raise ValueError("invalid state | sd={}, sc={}".format(self.sd, self.sc))
     
