@@ -143,7 +143,7 @@ class BarsManager:
         获取当前已存 Bar 数量
         :param security: 股票代码
         :param frequency: 频率周期
-        :return: 当前已存 Bar 数量
+        :return: 当前已存 Bar 数量；若该 (security, frequency) 尚无数据，则返回 0
         """
         key = self._key(security, frequency)
         return self._size.get(key, 0)
@@ -152,13 +152,27 @@ class BarsManager:
         获取最新日期时间
         :param security: 股票代码
         :param frequency: 频率周期
-        :return: 最新日期时间
+        :return: 最新日期时间（str），若无数据返回 None
         """
         key = self._key(security, frequency)
-        if key not in self.time_index:
-            log.error("time_index not found | security={}, frequency={}".format(security, frequency))
+        if key not in self._size or self._size[key] == 0:
             return None
-        return self.time_index[key][-1]
+
+        head = self._head[key]
+        size = self._size[key]
+        buf = self.bars[key]
+        cap = self.capacity
+
+        # 未满时，最新一根在物理下标 size-1；已满时，最新一根在 head 前一位
+        if size < cap:
+            latest_phys = size - 1
+        else:
+            latest_phys = (head - 1 + cap) % cap
+
+        latest_bar = buf[latest_phys]
+        if latest_bar is None:
+            return None
+        return latest_bar.datetime
        
         
     def get_oldest_datetime(self, security: str, frequency: str):
@@ -166,13 +180,27 @@ class BarsManager:
         获取最旧日期时间
         :param security: 股票代码
         :param frequency: 频率周期
-        :return: 最旧日期时间
+        :return: 最旧日期时间（str），若无数据返回 None
         """
         key = self._key(security, frequency)
-        if key not in self.time_index:
-            log.error("time_index not found | security={}, frequency={}".format(security, frequency))
+        if key not in self._size or self._size[key] == 0:
             return None
-        return self.time_index[key][0]
+
+        head = self._head[key]
+        size = self._size[key]
+        buf = self.bars[key]
+        cap = self.capacity
+
+        # 未满时，最旧一根在物理下标 0；已满时，最旧一根在 head 位置
+        if size < cap:
+            oldest_phys = 0
+        else:
+            oldest_phys = head
+
+        oldest_bar = buf[oldest_phys]
+        if oldest_bar is None:
+            return None
+        return oldest_bar.datetime
 
     def get_data_by_datetime(self, security: str, frequency: str, datetime: str):
         """
