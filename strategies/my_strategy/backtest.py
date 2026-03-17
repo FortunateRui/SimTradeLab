@@ -7,7 +7,7 @@
 
 import pickle
 import pandas as pd
-RESEARCH_PATH = get_research_path()
+# RESEARCH_PATH = get_research_path()
 
 
 
@@ -37,28 +37,31 @@ def initialize(context):
 
 
     # 初始化
-    fill_bars_manager(context)
-
-    # for security in g.securities:
-    #     _key = (security, g.frequency) 
-    #     g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
-    #     for offset in range(0, g.bars_manager.get_size(security, g.frequency)-1):
-    #         g.setup_machines_manager[_key].update_state(g.bars_manager.get_data_by_offset(security, g.frequency, g.bars_manager.get_oldest_datetime(security, g.frequency), offset).datetime)
-    for security in g.securities:
-        _key = (security, g.frequency) 
-        g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
-        size = g.bars_manager.get_size(security, g.frequency)
-        if size <= 0:
-            continue
-        start_datetime = g.bars_manager.get_oldest_datetime(security, g.frequency)
-        for offset in range(0, size-1):
-            bar = g.bars_manager.get_data_by_offset(security, g.frequency, start_datetime, offset)
-            g.setup_machines_manager[_key].update_state(bar.datetime)
-
+    context.is_warmup = False
+    
     # TODO: 是否有需要持久化的数据？如果有，通过pickle进行持久化，init、handle、after_trading_end中都要有相关的持久化恢复和保存
 
     
+def before_trading_start(context,data):
+    if context.is_warmup == False:
+        fill_bars_manager(context)
 
+        # for security in g.securities:
+        #     _key = (security, g.frequency) 
+        #     g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
+        #     for offset in range(0, g.bars_manager.get_size(security, g.frequency)-1):
+        #         g.setup_machines_manager[_key].update_state(g.bars_manager.get_data_by_offset(security, g.frequency, g.bars_manager.get_oldest_datetime(security, g.frequency), offset).datetime)
+        for security in g.securities:
+            _key = (security, g.frequency) 
+            g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
+            size = g.bars_manager.get_size(security, g.frequency)
+            if size - 5<= 0:
+                continue
+            start_datetime = g.bars_manager.get_oldest_datetime(security, g.frequency)
+            for offset in range(4, size-5):
+                bar = g.bars_manager.get_data_by_offset(security, g.frequency, start_datetime, offset)
+                g.setup_machines_manager[_key].update_state(bar.datetime)
+        context.is_warmup = True
 
 def handle_data(context, data):
     pass
