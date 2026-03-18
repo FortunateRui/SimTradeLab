@@ -7,7 +7,22 @@
 
 import pickle
 import pandas as pd
-# RESEARCH_PATH = get_research_path()
+
+
+def _get_setup_log_path():
+    """
+    获取保存 Setup 列表的 CSV 文件路径（位于研究路径下）。
+    注意：在 PTrade 平台上应将 RESEARCH_PATH 替换为 get_research_path() 返回的路径。
+    这里不依赖 os 模块，直接基于字符串拼接。
+    """
+    try:
+        base = get_research_path()
+    except Exception:
+        # 本地调试时若没有该 API，则退化为当前目录
+        base = "."
+    if not base.endswith("/") and not base.endswith("\\"):
+        base = base + "/"
+    return base + "DeMarker/td_setup_list.csv"
 
 
 
@@ -329,6 +344,66 @@ class SetupMachine:
         self.setup_list = []        # 存储当前的setup列表，每个元素为datetime字符串，初始化为空列表
         self.bm = g.bars_manager    # 存储股票K线数据的环形数组
 
+    def _append_current_setup_to_csv(self, signal_type: str):
+        """
+        将当前 setup_list 及对应的 Bar 详情追加写入 CSV 文件。
+        - 首次写入文件时，先写入表头行。
+        - 每个 setup_list 记录结束后追加一行空行。
+        CSV 列：security,frequency,signal_type,datetime,open,high,low,close,volume,amount
+        """
+        if not self.setup_list:
+            return
+        path = _get_setup_log_path()
+        # 判断是否需要写入表头：
+        # - 文件不存在或为空 -> 写表头
+        # - 文件存在但首行不是表头（历史文件）-> 覆盖重建并写表头
+        write_header = False
+        overwrite_existing = False
+        try:
+            f_check = open(path, "r", encoding="utf-8")
+            first_line = f_check.readline()
+            f_check.close()
+            if not first_line:
+                write_header = True
+            elif not first_line.startswith("security,frequency,signal_type,datetime,open,high,low,close,volume,amount"):
+                write_header = True
+                overwrite_existing = True
+        except Exception:
+            write_header = True
+
+        try:
+            mode = "w" if overwrite_existing else "a"
+            f = open(path, mode, encoding="utf-8")
+        except Exception:
+            return
+        try:
+            if write_header:
+                f.write("security,frequency,signal_type,datetime,open,high,low,close,volume,amount\n")
+            for dt in self.setup_list:
+                bar = self.bm.get_data_by_datetime(self.security, self.frequency, dt)
+                if bar is None:
+                    continue
+                amount_str = ""
+                if bar.amount is not None:
+                    amount_str = "{:.4f}".format(bar.amount)
+                line = "{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{},{}\n".format(
+                    self.security,
+                    self.frequency,
+                    signal_type,
+                    bar.datetime,
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.volume,
+                    amount_str,
+                )
+                f.write(line)
+            # 一个 setup_list 结束后空一行
+            f.write("\n")
+        finally:
+            f.close()
+
     def judge_input(self, datetime: str):
         """
         判断输入信号
@@ -537,7 +612,8 @@ class SetupMachine:
                 if self.setup_list.__len__() != 9:
                     raise ValueError("setup_list length is not 9 | setup_list={},check setup machine logic".format(self.setup_list))
                 # TODO: 判断是否是完美setup，并输出Buy Setup或完美Buy Setup信号
-                print("Buy Setup | (security,frequency)=({},{}), setup_list={}".format(self.security, self.frequency, self.setup_list))
+                # 将 Buy Setup 及其对应的 Bar 详情写入 CSV
+                self._append_current_setup_to_csv("BUYSETUP")
             case (1,0):
                 # q5状态
                 self.setup_list.clear()
@@ -554,7 +630,8 @@ class SetupMachine:
                 if self.setup_list.__len__() != 9:
                     raise ValueError("setup_list length is not 9 | setup_list={},check setup machine logic".format(self.setup_list))
                 # TODO: 判断是否是完美setup，并输出Sell Setup或完美Sell Setup信号
-                print("Sell Setup | (security,frequency)=({},{}), setup_list={}".format(self.security, self.frequency, self.setup_list))
+                # 将 Sell Setup 及其对应的 Bar 详情写入 CSV
+                self._append_current_setup_to_csv("SELLSETUP")
             case _:
                 raise ValueError("invalid state | sd={}, sc={}".format(self.sd, self.sc))
     
