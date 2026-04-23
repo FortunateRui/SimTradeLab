@@ -1,0 +1,57 @@
+{
+    "_comment": "TD 9-13 Sequential 策略配置文件。详细字段含义请参考同目录下的「说明.md」。",
+
+    "universe": {
+        "securities": [
+            "600519.SS",
+            "000858.SZ",
+            "601318.SS",
+            "600036.SS",
+            "000651.SZ"
+        ],
+        "benchmark": "000300.SS"
+    },
+
+    "data": {
+        "frequency": "1d",
+        "fq": "pre",
+        "lookback_count": 300,
+        "min_required_bars": 20
+    },
+
+    "backtest": {
+        "slippage": 0.001,
+        "limit_mode": "UNLIMITED"
+    },
+
+    "setup": {
+        "enabled": true,
+        "require_perfect_for_signal": false,
+        "extend_record_max": 18
+    },
+
+    "intersection": {
+        "_reserved": "TD 交叉规则（Intersection），后续更新中加入此功能",
+        "enabled": false
+    },
+
+    "countdown": {
+        "enabled": true,
+        "type": "sequence",
+        "require_perfect": false,
+        "tdst_cancel_rule": 4,
+        "cancel_on_opposite_setup": true,
+        "cancel_on_same_setup": true,
+        "_reserved_combo": "组合型 Countdown（Combo），后续更新中加入此功能",
+        "_reserved_recycle": "Recycle（循环计数）规则，后续更新中加入此功能",
+        "_reserved_termination": "TD Termination Count（TD 终结计数），后续更新中加入此功能"
+    },
+
+    "log": {
+        "level": "INFO",
+        "verbose_state_transition": false,
+        "verbose_countdown_step": true,
+        "csv_output": true,
+        "output_dir": "TDSignal"
+    }
+}

@@ -1,637 +1,1159 @@
 # -*- coding: utf-8 -*-
 """
-策略名：TD_9_13_Sequential
-作者：熊瑞
-功能：基于TD_9_13_Sequential的策略实现
+策略名: TD_9_13_Sequential_Signal
+功能:   基于 TD 9-13 Sequential 的信号识别（仅识别 Setup / Countdown 信号，不下单交易）
+环境:   PTrade 回测 / 交易引擎
+
+模块结构（单文件，按层划分；除 config.json 外不依赖任何其它本地文件）:
+    [1] 常量与默认配置        DEFAULT_CONFIG
+    [2] 路径与配置加载层      _join_research_path / load_config
+    [3] 日志层                StrategyLogger
+    [4] 数据层                Bar / MarketDataFetcher
+    [5] 信号层                SetupMachine / CountdownMachine / TDSignalProcessor
+    [6] 信号输出层            SignalRecorder
+    [7] PTrade 策略钩子层     initialize / before_trading_start / handle_data / after_trading_end
+
+设计要点:
+    * 数据层与信号层完全解耦：信号层只接受 Bar 序列，不感知数据来源；数据层只负责
+      从 PTrade API 获取并清洗 Bar 序列，不感知任何信号语义。
+    * 不再使用任何持久化缓存；按 README 推荐采用 "前复权 + 每日全量重算"。
+    * 跳过停牌日：只要 K 线 volume<=0 即视为停牌，从源头过滤；同时调用
+      get_stock_status('HALT') 进一步确认当日是否停牌，停牌则当日不产生信号。
+    * 仅在 PTrade 接口允许的钩子内调用对应接口（如 get_history / get_price 不能
+      在 initialize 中调用，所有数据获取放在 before_trading_start / handle_data）。
+    * 周期统一：本策略不支持混合频率，统一使用 config.data.frequency。
 """
 
-import pickle
-import pandas as pd
+import json
 
 
-def _get_setup_log_path():
+# =============================================================================
+# [1] 常量与默认配置
+# =============================================================================
+
+DEFAULT_CONFIG = {
+    "universe": {
+        "securities": ["600519.SS"],
+        "benchmark": "000300.SS",
+    },
+    "data": {
+        "frequency": "1d",
+        "fq": "pre",
+        "lookback_count": 300,
+        "min_required_bars": 20,
+    },
+    "backtest": {
+        "slippage": 0.001,
+        "limit_mode": "UNLIMITED",
+    },
+    "setup": {
+        "enabled": True,
+        "require_perfect_for_signal": False,
+        "extend_record_max": 18,
+    },
+    "intersection": {
+        "enabled": False,  # 预留，后续更新
+    },
+    "countdown": {
+        "enabled": True,
+        "type": "sequence",          # 预留 combo
+        "require_perfect": False,
+        "tdst_cancel_rule": 4,       # 1~5
+        "cancel_on_opposite_setup": True,
+        "cancel_on_same_setup": True,
+    },
+    "log": {
+        "level": "INFO",
+        "verbose_state_transition": False,
+        "verbose_countdown_step": True,
+        "csv_output": True,
+        "output_dir": "TDSignal",
+    },
+}
+
+
+# =============================================================================
+# [2] 路径与配置加载层
+# =============================================================================
+
+def _join_research_path(rel_path):
     """
-    获取保存 Setup 列表的 CSV 文件路径（位于研究路径下）。
-    注意：在 PTrade 平台上应将 RESEARCH_PATH 替换为 get_research_path() 返回的路径。
-    这里不依赖 os 模块，直接基于字符串拼接。
+    将相对路径拼接到 PTrade 的研究目录根路径下。
+    PTrade 禁用 os 模块，因此手工拼接。
+    本地调试若无 get_research_path，退化为 './'。
     """
+    base = "./"
     try:
-        base = get_research_path()
+        base = get_research_path()  # noqa: F821 - PTrade 注入
     except Exception:
-        # 本地调试时若没有该 API，则退化为当前目录
-        base = "."
+        base = "./"
     if not base.endswith("/") and not base.endswith("\\"):
         base = base + "/"
-    return base + "DeMarker/td_setup_list.csv"
+    return base + rel_path
 
 
-
-def initialize(context):
-    
-    # 基本配置
-    set_benchmark('000300.SS')  # 设置基准指数为沪深300
-    g.securities = [
-        '600519.SS',  # 贵州茅台
-        '000858.SZ',  # 五粮液
-        '601318.SS',  # 中国平安
-        '600036.SS',  # 招商银行
-        '000651.SZ',  # 格力电器
-    ]
-    set_universe(g.securities)    # 设置股票池，handle_data中的data参数会自动订阅股票池中的股票
-    g.frequency = "1d"  # 数据频率,如更改应随PTrade软件中的策略周期一同更改
-    g.cache_capacity = 300  # 缓存容量
-
-    # 回测参数设置
-    set_slippage(slippage=0.1)  # 设置滑点为+-0.05%
-    set_limit_mode('UNLIMITED')  # 设置回测中限仓模式为无限制
-
-    # 运行时变量
-    g.bars_manager = BarsManager(capacity=g.cache_capacity)  # 环形数组容量；(security, frequency) 在首次 add_new_data 时自动创建
-    g.setup_machines_manager = {}  # 存储setup机器的dict，key为(security, frequency)，value为SetupMachine对象
+def _deep_merge(default, override):
+    """
+    递归合并配置。override 中的值覆盖 default 中的同名键；override 中不存在的
+    键沿用 default。仅对 dict 进行递归，list / 标量直接覆盖。
+    """
+    if not isinstance(default, dict) or not isinstance(override, dict):
+        return override if override is not None else default
+    result = dict(default)
+    for k, v in override.items():
+        if k.startswith("_"):
+            # 以下划线开头的键视为注释/预留说明，不参与合并
+            continue
+        if k in result:
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
+def load_config(config_rel_path):
+    """
+    从研究目录下读取 config.json。文件不存在或解析失败时使用内置默认配置。
+    """
+    full_path = _join_research_path(config_rel_path)
+    user_cfg = None
+    try:
+        f = open(full_path, "r", encoding="utf-8")
+        try:
+            user_cfg = json.load(f)
+        finally:
+            f.close()
+    except Exception as e:
+        log.warning("[CONFIG] 读取配置文件失败，将使用内置默认配置 | path={}, err={}".format(full_path, e))  # noqa: F821
 
-    # 初始化
-    context.is_warmup = False
-    
-    # TODO: 是否有需要持久化的数据？如果有，通过pickle进行持久化，init、handle、after_trading_end中都要有相关的持久化恢复和保存
+    cfg = _deep_merge(DEFAULT_CONFIG, user_cfg or {})
+    log.info("[CONFIG] 配置加载完成 | path={}".format(full_path))  # noqa: F821
+    return cfg
 
-    
-def before_trading_start(context,data):
-    if context.is_warmup == False:
-        fill_bars_manager(context)
 
-        # for security in g.securities:
-        #     _key = (security, g.frequency) 
-        #     g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
-        #     for offset in range(0, g.bars_manager.get_size(security, g.frequency)-1):
-        #         g.setup_machines_manager[_key].update_state(g.bars_manager.get_data_by_offset(security, g.frequency, g.bars_manager.get_oldest_datetime(security, g.frequency), offset).datetime)
-        for security in g.securities:
-            _key = (security, g.frequency) 
-            g.setup_machines_manager[_key] = SetupMachine(security, g.frequency)
-            size = g.bars_manager.get_size(security, g.frequency)
-            if size - 5<= 0:
-                continue
-            start_datetime = g.bars_manager.get_oldest_datetime(security, g.frequency)
-            for offset in range(4, size-5):
-                bar = g.bars_manager.get_data_by_offset(security, g.frequency, start_datetime, offset)
-                g.setup_machines_manager[_key].update_state(bar.datetime)
-        context.is_warmup = True
+# =============================================================================
+# [3] 日志层
+# =============================================================================
 
-def handle_data(context, data):
-    pass
+class StrategyLogger:
+    """
+    日志包装器：统一前缀 [TD]，在每条日志中带上 security/frequency/datetime 等上下文，
+    便于在多标的、多周期场景下定位问题。
+    底层依赖 PTrade 注入的全局 log 对象。
+    """
 
-def after_trading_end(context, data):
-    pass
+    LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+    def __init__(self, level="INFO", verbose_state_transition=False, verbose_countdown_step=True):
+        self.level = self.LEVEL_ORDER.get(str(level).upper(), 20)
+        self.verbose_state_transition = bool(verbose_state_transition)
+        self.verbose_countdown_step = bool(verbose_countdown_step)
+
+    def _enabled(self, level_name):
+        return self.LEVEL_ORDER[level_name] >= self.level
+
+    @staticmethod
+    def _fmt_kv(kvs):
+        if not kvs:
+            return ""
+        return " | " + " ".join("{}={}".format(k, v) for k, v in kvs.items())
+
+    def _emit(self, level_name, message, security=None, frequency=None, datetime_=None, **kvs):
+        if not self._enabled(level_name):
+            return
+        ctx = ""
+        if security is not None:
+            ctx += "[sec={}]".format(security)
+        if frequency is not None:
+            ctx += "[freq={}]".format(frequency)
+        if datetime_ is not None:
+            ctx += "[dt={}]".format(datetime_)
+        line = "[TD]{} {}{}".format(ctx, message, self._fmt_kv(kvs))
+        method = getattr(log, level_name.lower(), log.info)  # noqa: F821
+        method(line)
+
+    def debug(self, message, **kw):
+        self._emit("DEBUG", message, **kw)
+
+    def info(self, message, **kw):
+        self._emit("INFO", message, **kw)
+
+    def warning(self, message, **kw):
+        self._emit("WARNING", message, **kw)
+
+    def error(self, message, **kw):
+        self._emit("ERROR", message, **kw)
+
+    def state_transition(self, message, **kw):
+        if self.verbose_state_transition:
+            self._emit("DEBUG", message, **kw)
+
+    def countdown_step(self, message, **kw):
+        if self.verbose_countdown_step:
+            self._emit("DEBUG", message, **kw)
+
+
+# =============================================================================
+# [4] 数据层
+# =============================================================================
 
 class Bar:
     """
-    说明：存储单根K线数据的对象
+    单根 K 线数据对象。仅承载数据，不含任何信号语义。
     """
+    __slots__ = ("security", "frequency", "datetime", "open", "high", "low", "close", "volume", "amount")
 
-    def __init__(self, security:str, frequency:str, datetime:str, open:float, high:float, low:float, close:float, volume:int, amount:float=None):
-        """
-        初始化
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :param datetime: 日期时间
-        :param open: 开盘价
-        :param high: 最高价
-        :param low: 最低价
-        :param close: 收盘价
-        :param volume: 成交量
-        :param amount: 成交额（可选）
-        """
+    def __init__(self, security, frequency, datetime_, open_, high, low, close, volume, amount=None):
         self.security = security
         self.frequency = frequency
-        self.datetime = datetime
-        self.open = open
-        self.high = high
-        self.low = low
-        self.close = close
-        self.volume = volume
-        self.amount = amount
+        self.datetime = datetime_
+        self.open = float(open_)
+        self.high = float(high)
+        self.low = float(low)
+        self.close = float(close)
+        self.volume = float(volume)
+        self.amount = None if amount is None else float(amount)
 
     def __repr__(self):
-        return "<Bar {} O:{:.2f} H:{:.2f} L:{:.2f} C:{:.2f} V:{}>".format(
+        return "<Bar {} O:{:.2f} H:{:.2f} L:{:.2f} C:{:.2f} V:{:.0f}>".format(
             self.datetime, self.open, self.high, self.low, self.close, self.volume
         )
 
 
-
-class BarsManager:
+class MarketDataFetcher:
     """
-    说明：存储近 n 根股票 K 线数据的对象，使用环形数组 + 哈希表，避免 pop(0) 导致下标错位。
+    数据层：负责从 PTrade API 获取行情，并清洗为按时间升序的 List[Bar]。
+    职责单一：只关心行情数据获取与停牌过滤；不感知任何信号逻辑。
 
-    self.member:
-        self.capacity: int       # 缓存容量，即每个 (security, frequency) 最多存储 capacity 条最新数据
-        self.bars: dict          # (security, frequency) -> 环形数组 list[Bar|None]，固定长度 capacity
-        self.time_index: dict    # (security, frequency) -> { datetime -> 环形数组物理下标 }
-        self._head: dict         # (security, frequency) -> 下一次写入的环形数组下标
-        self._size: dict         # (security, frequency) -> 当前已存 Bar 数量
+    注意 PTrade API 使用范围：
+      * get_history / get_price 不能在 initialize 中调用；
+      * 本类的方法仅可在 before_trading_start / handle_data / after_trading_end / run_daily 中调用。
     """
-    def __init__(self, capacity: int = 300):
-        self.capacity = capacity
-        self.bars = {}
-        self.time_index = {}
-        self._head = {}
-        self._size = {}
 
-    def _key(self, security: str, frequency: str):
+    def __init__(self, frequency, fq, lookback_count, logger):
+        self.frequency = frequency
+        self.fq = fq
+        self.lookback_count = int(lookback_count)
+        self.logger = logger
+
+    def fetch_recent_bars(self, security):
         """
-        根据股票代码和频率周期生成key
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :return: key，即(security, frequency)
+        拉取该标的最近 lookback_count 根 K 线（含当前周期），按时间升序返回。
+        过滤掉 volume<=0 的停牌 K 线。
+
+        返回:
+            List[Bar]，可能为空。
         """
-        return (security, frequency)
+        try:
+            df = get_history(  # noqa: F821 - PTrade 注入
+                count=self.lookback_count,
+                frequency=self.frequency,
+                field=["open", "high", "low", "close", "volume", "money"],
+                security_list=security,
+                fq=self.fq,
+                include=True,
+            )
+        except Exception as e:
+            self.logger.error("get_history 调用异常", security=security, frequency=self.frequency, err=e)
+            return []
 
-    def _ensure_slot(self, key):
-        if key not in self.bars:
-            self.bars[key] = [None] * self.capacity
-            self.time_index[key] = {}
-            self._head[key] = 0
-            self._size[key] = 0
-    
-    def get_size(self, security: str, frequency: str):
-        """
-        获取当前已存 Bar 数量
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :return: 当前已存 Bar 数量；若该 (security, frequency) 尚无数据，则返回 0
-        """
-        key = self._key(security, frequency)
-        return self._size.get(key, 0)
-    def get_latest_datetime(self, security: str, frequency: str):
-        """
-        获取最新日期时间
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :return: 最新日期时间（str），若无数据返回 None
-        """
-        key = self._key(security, frequency)
-        if key not in self._size or self._size[key] == 0:
-            return None
+        if df is None or len(df) == 0:
+            self.logger.warning("get_history 返回空数据", security=security, frequency=self.frequency)
+            return []
 
-        head = self._head[key]
-        size = self._size[key]
-        buf = self.bars[key]
-        cap = self.capacity
-
-        # 未满时，最新一根在物理下标 size-1；已满时，最新一根在 head 前一位
-        if size < cap:
-            latest_phys = size - 1
-        else:
-            latest_phys = (head - 1 + cap) % cap
-
-        latest_bar = buf[latest_phys]
-        if latest_bar is None:
-            return None
-        return latest_bar.datetime
-       
-        
-    def get_oldest_datetime(self, security: str, frequency: str):
-        """
-        获取最旧日期时间
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :return: 最旧日期时间（str），若无数据返回 None
-        """
-        key = self._key(security, frequency)
-        if key not in self._size or self._size[key] == 0:
-            return None
-
-        head = self._head[key]
-        size = self._size[key]
-        buf = self.bars[key]
-        cap = self.capacity
-
-        # 未满时，最旧一根在物理下标 0；已满时，最旧一根在 head 位置
-        if size < cap:
-            oldest_phys = 0
-        else:
-            oldest_phys = head
-
-        oldest_bar = buf[oldest_phys]
-        if oldest_bar is None:
-            return None
-        return oldest_bar.datetime
-
-    def get_data_by_datetime(self, security: str, frequency: str, datetime: str):
-        """
-        根据日期时间获取数据
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :param datetime: 日期时间
-        :return: Bar对象，如果该日期时间的数据不存在，则返回 None
-        """
-        key = self._key(security, frequency)
-        if key not in self.time_index or datetime not in self.time_index[key]:
-            log.error("datetime not found in time_index | security={}, frequency={}, datetime={}".format(security, frequency, datetime))
-            return None
-        idx = self.time_index[key][datetime]
-        return self.bars[key][idx]
-
-    def get_data_by_offset(self, security: str, frequency: str, datetime: str, offset: int):
-        """
-        根据日期时间和偏移量获取数据
-        :param security: 股票代码
-        :param frequency: 频率周期
-        :param datetime: 日期时间
-        :param offset: 偏移量，-4 代表往前第 4 根 k 线（时间更早）
-        :return: 数据，若不存在或越界则返回 None
-        """
-        key = self._key(security, frequency)
-        if key not in self.time_index or datetime not in self.time_index[key]:
-            log.error("datetime not found in time_index | security={}, frequency={}, datetime={}".format(security, frequency, datetime))
-            return None
-
-        head, size, key_bars = self._head[key], self._size[key], self.bars[key]
-        cap = self.capacity
-        phys = self.time_index[key][datetime]
-
-        # time_index 存的是物理下标，需转为逻辑下标（0=最旧，size-1=最新）
-        if size < cap:
-            logical = phys
-        else:
-            # cap -logical = head - phys
-            logical = (phys - head + cap) % cap
-
-        want_logical = logical + offset
-        if want_logical < 0 or want_logical >= size:
-            log.error("offset out of range: want_logical={}, size={}".format(want_logical, size))
-            return None
-
-        # 逻辑下标转回物理下标
-        if size < cap:
-            phys_want = want_logical
-        else:
-            phys_want = (head + want_logical) % cap
-        return key_bars[phys_want]
-
-
-
-    def add_new_data(self, bar: Bar):
-        """
-        添加新的 K 线数据。使用环形数组覆盖最旧的一条，物理下标不变，time_index 只增删一条映射。
-        """
-        # 此处为防御性编程，应在上层就确保不会添加交易量为0的K线数据
-        if bar.volume <= 0:
-            log.error("volume is less than 0: volume={}".format(bar.volume))
-            return
-        key = self._key(bar.security, bar.frequency)
-        self._ensure_slot(key)
-        head = self._head[key]
-        size = self._size[key]
-        key_bars = self.bars[key]
-        key_time_index = self.time_index[key]
-        if bar.datetime in key_time_index:
-            log.error("datetime already exists when adding new data | security={}, frequency={}, datetime={}".format(bar.security, bar.frequency, bar.datetime))
-        # 若已满，覆盖最旧位置并删除其 datetime 映射
-        if size >= self.capacity:
-            old_bar = key_bars[head]
-            if old_bar is not None:
-                key_time_index.pop(old_bar.datetime, None)
-        else:
-            size += 1
-            self._size[key] = size
-        key_bars[head] = bar
-        key_time_index[bar.datetime] = head
-        self._head[key] = (head + 1) % self.capacity
-
-def fill_bars_manager(context):
-    """
-    使用 get_price 获取当前日（或当前周期）之前的 K 线，按 (security, frequency) 填入 g.bars_manager 缓存。
-    应在 before_trading_start 或 handle_data 中调用，且已设置 g.securities、g.frequency、g.bars_manager、g.cache_capacity。
-    """
-    assert hasattr(g, "bars_manager") and hasattr(g, "securities") and hasattr(g, "frequency") and hasattr(g, "cache_capacity"), "bars_manager, securities, frequency, or cache_capacity not set"
-    bm = g.bars_manager
-    frequency = g.frequency
-    securities = g.securities
-
-    # if frequency in ['1d']:
-    #     end_date = (context.blotter.current_dt - pd.Timedelta(days=1)).strftime("%Y%m%d")     # 日线及更高周期，日期格式为YYYYMMDD
-    # else:
-    #     end_date = (context.blotter.current_dt).strftime("%Y%m%d%H%M") # 分钟线格式为YYYYMMDDHHMM, -1天
-
-    fields = ["open", "high", "low", "close", "volume", "money"]
-    _count = int(g.cache_capacity * 1.5 + 0.9999)    # 向上取整，确保至少有1.5倍缓存容量的数据，避免因停牌等导致数据不足
-    for security in securities:
-
-        df = get_price(security=security, frequency=frequency, fields=fields, count=_count,fq="pre")
-        if df is None or df.empty:
-            log.warning("get_price 返回空结果 | security={}, frequency={}, fields={}, count={}".format(security, frequency, fields, _count))
-            continue
-        # df 是 pandas.DataFrame, 行索引为 datetime.datetime, 列索引为行情字段名(str)
+        bars = []
+        skipped = 0
         for dt, row in df.iterrows():
-            if row["volume"] <= 0:
-                continue    # 跳过成交量为0的bar
-            bar = Bar(security, frequency, dt.strftime("%Y%m%d%H%M%S"), row["open"], row["high"], row["low"], row["close"], row["volume"], row.get("money", None))
-            bm.add_new_data(bar)
-
-
-class SetupMachine: 
-
-    # 构造函数
-    def __init__(self, security: str, frequency: str):
-        assert security is not None and frequency is not None, "security and frequency must be set in SetupMachine"
-        assert hasattr(g, "bars_manager"), "bars_manager must be set before initializing SetupMachine"
-        self.security = security    # 股票代码
-        self.frequency = frequency  # 数据频率
-        self.last_datetime = None   # 记录当前状态对应的日期时间，初始化为None
-        self.sd = 0                 # 表示状态的变量1，实际含义是当前setup的方向，1代表买入setup，-1代表卖出setup，0代表没有方向，初始化为0
-        self.sc = 0                 # 表示状态的变量2，实际含义是当前setup的计数，0代表没有计数，初始化为0
-        self.setup_list = []        # 存储当前的setup列表，每个元素为datetime字符串，初始化为空列表
-        self.bm = g.bars_manager    # 存储股票K线数据的环形数组
-
-    def _append_current_setup_to_csv(self, signal_type: str):
-        """
-        将当前 setup_list 及对应的 Bar 详情追加写入 CSV 文件。
-        - 首次写入文件时，先写入表头行。
-        - 每个 setup_list 记录结束后追加一行空行。
-        CSV 列：security,frequency,signal_type,datetime,open,high,low,close,volume,amount
-        """
-        if not self.setup_list:
-            return
-        path = _get_setup_log_path()
-        # 判断是否需要写入表头：
-        # - 文件不存在或为空 -> 写表头
-        # - 文件存在但首行不是表头（历史文件）-> 覆盖重建并写表头
-        write_header = False
-        overwrite_existing = False
-        try:
-            f_check = open(path, "r", encoding="utf-8")
-            first_line = f_check.readline()
-            f_check.close()
-            if not first_line:
-                write_header = True
-            elif not first_line.startswith("security,frequency,signal_type,datetime,open,high,low,close,volume,amount"):
-                write_header = True
-                overwrite_existing = True
-        except Exception:
-            write_header = True
-
-        try:
-            mode = "w" if overwrite_existing else "a"
-            f = open(path, mode, encoding="utf-8")
-        except Exception:
-            return
-        try:
-            if write_header:
-                f.write("security,frequency,signal_type,datetime,open,high,low,close,volume,amount\n")
-            for dt in self.setup_list:
-                bar = self.bm.get_data_by_datetime(self.security, self.frequency, dt)
-                if bar is None:
-                    continue
-                amount_str = ""
-                if bar.amount is not None:
-                    amount_str = "{:.4f}".format(bar.amount)
-                line = "{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{},{}\n".format(
-                    self.security,
-                    self.frequency,
-                    signal_type,
-                    bar.datetime,
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    bar.volume,
-                    amount_str,
+            try:
+                volume = float(row["volume"])
+            except Exception:
+                skipped += 1
+                continue
+            if volume <= 0:
+                skipped += 1
+                continue
+            try:
+                bar = Bar(
+                    security=security,
+                    frequency=self.frequency,
+                    datetime_=self._format_datetime(dt),
+                    open_=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    close=row["close"],
+                    volume=volume,
+                    amount=row.get("money", None) if hasattr(row, "get") else None,
                 )
-                f.write(line)
-            # 一个 setup_list 结束后空一行
-            f.write("\n")
-        finally:
-            f.close()
+            except Exception as e:
+                self.logger.error("构造 Bar 失败", security=security, dt=dt, err=e)
+                skipped += 1
+                continue
+            bars.append(bar)
 
-    def judge_input(self, datetime: str):
+        self.logger.debug(
+            "拉取行情完成", security=security, frequency=self.frequency,
+            total=len(df), valid=len(bars), skipped_halt=skipped,
+        )
+        return bars
+
+    @staticmethod
+    def _format_datetime(dt):
+        """统一日期时间格式为字符串，便于跨场景比较与写日志。"""
+        try:
+            # pandas Timestamp / datetime 均有 strftime
+            return dt.strftime("%Y%m%d%H%M%S")
+        except Exception:
+            return str(dt)
+
+    @staticmethod
+    def is_halt_today(security, query_date_yyyymmdd=None):
         """
-        判断输入信号
-        :param datetime: 日期时间（应按时间递增调用）
-        :return: 输入信号，BS代表买入结构方向，SS代表卖出结构方向，EQ代表无变化
+        通过 get_stock_status 查询当日停牌状态。失败时保守返回 False（即不视为停牌）。
+        参数:
+            query_date_yyyymmdd: 'YYYYmmdd' 格式字符串；None 表示当前周期。
         """
-        if self.last_datetime is not None and datetime <= self.last_datetime:
-            raise ValueError("datetime is less than last_datetime | datetime={}, last_datetime={}".format(datetime, self.last_datetime))
-        bar = self.bm.get_data_by_datetime(self.security, self.frequency, datetime)
-        bar_pre_4 = self.bm.get_data_by_offset(self.security, self.frequency, datetime, -4)
-        if bar is None or bar_pre_4 is None:
-            raise ValueError("bar or bar_pre_4 is None | security={}, frequency={}, datetime={}".format(self.security, self.frequency, datetime))
-        if bar.close < bar_pre_4.close:
+        try:
+            status = get_stock_status([security], "HALT", query_date_yyyymmdd)  # noqa: F821
+            if status is None:
+                return False
+            return bool(status.get(security, False))
+        except Exception:
+            return False
+
+
+# =============================================================================
+# [5] 信号层
+# =============================================================================
+
+# ---- Setup 状态枚举（仅用于可读日志，不影响计算） ------------------------------------
+SETUP_STATE_NAME = {
+    (0, 0): "q0_idle",
+    (-1, 0): "q1_post_ss_idle",
+    (1, 1): "q2_buy_setup_d1",
+    (1, 9): "q4_buy_setup_done",
+    (1, 0): "q5_post_buy_setup",
+    (-1, 1): "q6_sell_setup_d1",
+    (-1, 9): "q8_sell_setup_done",
+}
+
+
+class SetupMachine:
+    """
+    Setup 子状态机。完全复用原项目的状态转移图，仅做了如下解耦改造：
+      * 不再依赖 BarsManager；输入仅为 (bar, prev_4_close)。
+      * 状态完成时把 setup_bars（最近 9 根 K 线对象）暴露给上层，便于 Countdown 计算 TDST 等。
+
+    判定规则:
+        BS (Buy Setup 输入)   : bar.close < prev_4_close
+        SS (Sell Setup 输入)  : bar.close > prev_4_close
+        EQ (相等)             : 取消任何进行中的 setup（要求严格小于 / 大于）
+
+    完美 Setup（参考 README）:
+        Buy : (S[7].low<=S[5].low and S[7].low<=S[6].low) or (S[8].low<=S[5].low and S[8].low<=S[6].low)
+        Sell: (S[7].high>=S[5].high and S[7].high>=S[6].high) or (S[8].high>=S[5].high and S[8].high>=S[6].high)
+        说明：README 写的是 "第8或第9个交易日"、"第6和第7个交易日"，对应 1-based 的索引；
+              本实现内部 setup_bars 为 0-based list，index 5/6/7/8 即对应 README 的第6/7/8/9 根。
+    """
+
+    def __init__(self, security, frequency, logger):
+        self.security = security
+        self.frequency = frequency
+        self.logger = logger
+
+        # 状态变量（沿用原项目命名）
+        self.sd = 0   # 方向 1=买 -1=卖 0=无
+        self.sc = 0   # 计数 0~9
+        self.last_datetime = None
+
+        # 最近一次正在累积的 setup 对应的 K 线，最多 9 根
+        self.setup_bars = []
+
+    # ----- 输入分类 -----
+    @staticmethod
+    def classify(bar_close, prev_4_close):
+        if bar_close < prev_4_close:
             return "BS"
-        elif bar.close > bar_pre_4.close:
+        if bar_close > prev_4_close:
             return "SS"
+        return "EQ"
+
+    # ----- 完美 Setup 判定 -----
+    @staticmethod
+    def _is_perfect_buy(setup_bars):
+        if len(setup_bars) < 9:
+            return False
+        s6, s7, s8, s9 = setup_bars[5], setup_bars[6], setup_bars[7], setup_bars[8]
+        cond_8 = (s8.low <= s6.low) and (s8.low <= s7.low)
+        cond_9 = (s9.low <= s6.low) and (s9.low <= s7.low)
+        return cond_8 or cond_9
+
+    @staticmethod
+    def _is_perfect_sell(setup_bars):
+        if len(setup_bars) < 9:
+            return False
+        s6, s7, s8, s9 = setup_bars[5], setup_bars[6], setup_bars[7], setup_bars[8]
+        cond_8 = (s8.high >= s6.high) and (s8.high >= s7.high)
+        cond_9 = (s9.high >= s6.high) and (s9.high >= s7.high)
+        return cond_8 or cond_9
+
+    # ----- 步进 -----
+    def step(self, bar, prev_4_close):
+        """
+        喂入一根 K 线和它对应的 t-4 收盘价，更新状态。
+
+        返回:
+            None 或 dict:
+                {
+                    "type": "BUY_SETUP" / "SELL_SETUP",
+                    "perfect": bool,
+                    "setup_bars": [Bar x 9]   (副本)
+                }
+            仅在 setup 第 9 根完成的当根 K 线返回信号。
+        """
+        if self.last_datetime is not None and bar.datetime <= self.last_datetime:
+            self.logger.error(
+                "SetupMachine 时间逆序", security=self.security, frequency=self.frequency,
+                datetime_=bar.datetime, last=self.last_datetime,
+            )
+            return None
+
+        inp = self.classify(bar.close, prev_4_close)
+
+        prev_state = (self.sd, self.sc)
+        new_sd, new_sc = self._transit(prev_state, inp)
+        self.sd, self.sc = new_sd, new_sc
+        self.last_datetime = bar.datetime
+
+        # 维护 setup_bars
+        signal = self._apply_state_action(bar)
+
+        self.logger.state_transition(
+            "Setup transit", security=self.security, frequency=self.frequency, datetime_=bar.datetime,
+            input=inp, prev=SETUP_STATE_NAME.get(prev_state, prev_state),
+            curr=SETUP_STATE_NAME.get((self.sd, self.sc), (self.sd, self.sc)),
+            sc=self.sc,
+        )
+        return signal
+
+    def _transit(self, state, inp):
+        """根据当前状态和输入返回新状态 (sd, sc)。原项目 FSM 的等价实现。"""
+        sd, sc = state
+
+        # q0
+        if (sd, sc) == (0, 0):
+            return (1, 0) if inp == "BS" else (-1, 0) if inp == "SS" else (0, 0)
+        # q1
+        if (sd, sc) == (-1, 0):
+            return (1, 1) if inp == "BS" else (-1, 0) if inp == "SS" else (0, 0)
+        # q2
+        if (sd, sc) == (1, 1):
+            return (1, 2) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
+        # q3 (buy setup ongoing 2..8)
+        if sd == 1 and 2 <= sc <= 8:
+            return (1, sc + 1) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
+        # q4 (buy setup done)
+        if (sd, sc) == (1, 9):
+            return (1, 0) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
+        # q5 (post buy setup)
+        if (sd, sc) == (1, 0):
+            return (1, 0) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
+        # q6 (sell setup d1)
+        if (sd, sc) == (-1, 1):
+            return (1, 1) if inp == "BS" else (-1, 2) if inp == "SS" else (0, 0)
+        # q7 (sell setup ongoing 2..8)
+        if sd == -1 and 2 <= sc <= 8:
+            return (1, 1) if inp == "BS" else (-1, sc + 1) if inp == "SS" else (0, 0)
+        # q8 (sell setup done)
+        if (sd, sc) == (-1, 9):
+            return (1, 0) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
+
+        raise ValueError("invalid setup state: ({}, {})".format(sd, sc))
+
+    def _apply_state_action(self, bar):
+        """根据进入的新状态维护 setup_bars，并在第 9 根完成时返回信号。"""
+        sd, sc = self.sd, self.sc
+
+        if (sd, sc) in ((0, 0), (-1, 0), (1, 0)):
+            self.setup_bars = []
+            return None
+
+        if (sd, sc) in ((1, 1), (-1, 1)):
+            # 新 setup 第 1 根
+            self.setup_bars = [bar]
+            return None
+
+        if sd == 1 and 2 <= sc <= 8:
+            self.setup_bars.append(bar)
+            return None
+
+        if sd == -1 and 2 <= sc <= 8:
+            self.setup_bars.append(bar)
+            return None
+
+        if (sd, sc) == (1, 9):
+            self.setup_bars.append(bar)
+            if len(self.setup_bars) != 9:
+                self.logger.error(
+                    "Buy Setup 完成时 setup_bars 长度异常",
+                    security=self.security, datetime_=bar.datetime, length=len(self.setup_bars),
+                )
+                return None
+            return {
+                "type": "BUY_SETUP",
+                "perfect": self._is_perfect_buy(self.setup_bars),
+                "setup_bars": list(self.setup_bars),
+            }
+
+        if (sd, sc) == (-1, 9):
+            self.setup_bars.append(bar)
+            if len(self.setup_bars) != 9:
+                self.logger.error(
+                    "Sell Setup 完成时 setup_bars 长度异常",
+                    security=self.security, datetime_=bar.datetime, length=len(self.setup_bars),
+                )
+                return None
+            return {
+                "type": "SELL_SETUP",
+                "perfect": self._is_perfect_sell(self.setup_bars),
+                "setup_bars": list(self.setup_bars),
+            }
+
+        return None
+
+
+class CountdownMachine:
+    """
+    Countdown 状态机（序列型 Sequence Countdown）。
+
+    生命周期:
+        由 TDSignalProcessor 在 Setup 完成时通过 start() 创建，进行中通过 step() 推进，
+        触发完成 / 取消时由处理器丢弃实例。
+
+    序列计数规则（README）:
+        Buy  : bar.close <= bar[t-2].low  → count + 1
+        Sell : bar.close >= bar[t-2].high → count + 1
+        最大 13；可不连续。
+
+    完美 Countdown（README）:
+        Buy  : count[13].close <= count[8].close
+        Sell : count[13].close >= count[8].close
+        当 count==12 后下一根满足一般条件但不满足完美条件时，count 不进位为 13，
+        而是输出 "+" 暂记信号；继续等待下一根满足条件 + 完美的 K 线，方进位为 13。
+
+    取消条件:
+        a. 出现相反方向 Setup 完成（由处理器外部触发 cancel，原因 'opposite_setup'）
+        b. 出现新的同向 Setup 完成（由处理器外部触发 cancel，原因 'same_setup'）
+        c. TDST 突破（5 选 1 规则，本类内部 step() 中检测）
+
+    TDST 5 选 1 规则（针对 Buy Countdown，Sell 取反）:
+        1. bar.high  >  max(setup_bars.close)
+        2. bar.high  >  max(setup_bars.high)
+        3. bar.close >  max(setup_bars.close)
+        4. bar.close >  max(setup_bars.high)         （默认）
+        5. bar.close >  max(true_high(setup_bars))   true_high = max(high, prev_close)
+    """
+
+    def __init__(self, direction, setup_bars, config_countdown, logger, security, frequency):
+        """
+        direction: 1=Buy, -1=Sell
+        setup_bars: 触发本 Countdown 的 9 根 setup K 线（按时间升序）
+        """
+        self.direction = direction
+        self.setup_bars = list(setup_bars)
+        self.config = config_countdown
+        self.logger = logger
+        self.security = security
+        self.frequency = frequency
+
+        self.count = 0
+        self.bars_at_count = []          # 长度 == self.count，每个元素为对应的 Bar
+        self.completed = False
+        self.cancelled = False
+        self.cancel_reason = None
+        # 当 count==12 时，下一根满足一般条件但不满足完美条件 → 输出 "+"
+        # 该标志仅用于上层日志/记录
+        self.last_plus_dt = None
+
+        # 预计算 TDST 阈值（buy: 取最大；sell: 取最小）
+        self._tdst_threshold = self._compute_tdst_threshold()
+
+    # ----- TDST 阈值预计算 -----
+    def _compute_tdst_threshold(self):
+        rule = int(self.config.get("tdst_cancel_rule", 4))
+        bars = self.setup_bars
+        if not bars:
+            return None
+        if self.direction == 1:
+            if rule == 1:
+                return max(b.close for b in bars)
+            if rule == 2:
+                return max(b.high for b in bars)
+            if rule == 3:
+                return max(b.close for b in bars)
+            if rule == 4:
+                return max(b.high for b in bars)
+            if rule == 5:
+                # true_high 需要 prev_close，这里用 setup_bars 内部前一根；首根 true_high=high
+                hi = []
+                for i, b in enumerate(bars):
+                    if i == 0:
+                        hi.append(b.high)
+                    else:
+                        hi.append(max(b.high, bars[i - 1].close))
+                return max(hi)
         else:
-            return "EQ"
+            if rule == 1:
+                return min(b.close for b in bars)
+            if rule == 2:
+                return min(b.low for b in bars)
+            if rule == 3:
+                return min(b.close for b in bars)
+            if rule == 4:
+                return min(b.low for b in bars)
+            if rule == 5:
+                lo = []
+                for i, b in enumerate(bars):
+                    if i == 0:
+                        lo.append(b.low)
+                    else:
+                        lo.append(min(b.low, bars[i - 1].close))
+                return min(lo)
+        return None
 
-    def update_state(self, datetime: str): 
-        """
-        更新状态：根据输入信号和当前状态,进行状态转移,更新last_datetime,执行当前状态对应的逻辑
-        状态转移图详见文档
-        :param datetime: 日期时间
-        """
-        input = self.judge_input(datetime)
-        match (self.sd, self.sc):
-            case (0,0):
-                # q0状态
-                if input == "BS":
-                    # 转移至q5状态
-                    self.sd = 1
-                    self.sc = 0
-                elif input == "SS":
-                    # 转移至q1状态
-                    self.sd = -1
-                    self.sc = 0
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (-1,0):
-                # q1状态
-                if input == "BS":
-                    # 转移至q2状态
-                    self.sd = 1
-                    self.sc = 1
-                elif input == "SS":
-                    # 转移至q1状态
-                    self.sd = -1
-                    self.sc = 0
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (1,1):
-                # q2状态
-                if input == "BS":
-                    # 转移至q3状态
-                    self.sd = 1
-                    self.sc += 1
-                elif input == "SS":
-                    # 转移至q6状态
-                    self.sd = -1
-                    self.sc = 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (1,c) if c >= 2 and c <= 8:
-                # q3状态
-                if input == "BS":
-                    # 转移至q3/q4状态
-                    self.sd = 1
-                    self.sc += 1
-                elif input == "SS":
-                    # 转移至q6状态
-                    self.sd = -1
-                    self.sc = 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (1,9):
-                # q4状态
-                if input == "BS":
-                    # 转移至q5状态
-                    self.sd = 1
-                    self.sc = 0
-                elif input == "SS":
-                    # 转移至q6状态
-                    self.sd = -1
-                    self.sc = 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (1,0):
-                # q5状态
-                if input == "BS":
-                    # 转移至q5状态
-                    self.sd = 1
-                    self.sc = 0
-                elif input == "SS":
-                    # 转移至q6状态
-                    self.sd = -1
-                    self.sc = 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (-1,1):
-                # q6状态
-                if input == "BS":
-                    # 转移至q2状态
-                    self.sd = 1
-                    self.sc = 1
-                elif input == "SS":
-                    # 转移至q7状态
-                    self.sd = -1
-                    self.sc += 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (-1,c) if c >= 2 and c <= 8:
-                # q7状态
-                if input == "BS":
-                    # 转移至q2状态
-                    self.sd = 1
-                    self.sc = 1
-                elif input == "SS":
-                    # 转移至q7状态
-                    self.sd = -1
-                    self.sc += 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case (-1,9):
-                # q8状态
-                if input == "BS":
-                    # 转移至q5状态
-                    self.sd = 1
-                    self.sc = 0
-                elif input == "SS":
-                    # 转移至q6状态
-                    self.sd = -1
-                    self.sc = 1
-                elif input == "EQ":
-                    # 转移至q0状态
-                    self.sd = 0
-                    self.sc = 0
-                else:
-                    raise ValueError("invalid input | input={}".format(input))
-                self.last_datetime = datetime
-            case _:
-                raise ValueError("invalid state | sd={}, sc={}".format(self.sd, self.sc))
-        self.execute_current_state()
+    def _check_tdst_break(self, bar, prev_close):
+        rule = int(self.config.get("tdst_cancel_rule", 4))
+        thr = self._tdst_threshold
+        if thr is None:
+            return False
+        if self.direction == 1:
+            if rule == 1:
+                return bar.high > thr
+            if rule == 2:
+                return bar.high > thr
+            if rule == 3:
+                return bar.close > thr
+            if rule == 4:
+                return bar.close > thr
+            if rule == 5:
+                return bar.close > thr  # rule 5: 直接比较收盘价 > true_high 最大值
+        else:
+            if rule == 1:
+                return bar.low < thr
+            if rule == 2:
+                return bar.low < thr
+            if rule == 3:
+                return bar.close < thr
+            if rule == 4:
+                return bar.close < thr
+            if rule == 5:
+                return bar.close < thr
+        return False
 
-    def execute_current_state(self):
+    # ----- 完美 Countdown 判定（针对最终第 13 根） -----
+    def _is_perfect_13(self, bar_13):
+        """要求第 13 根（候选）相对第 8 根的关系。"""
+        if len(self.bars_at_count) < 8:
+            return False
+        bar_8 = self.bars_at_count[7]  # 0-based
+        if self.direction == 1:
+            return bar_13.close <= bar_8.close
+        return bar_13.close >= bar_8.close
+
+    # ----- 主步进 -----
+    def step(self, bar, prev_2_low, prev_2_high, prev_close):
         """
-        执行当前状态对应的逻辑
+        喂入一根 K 线，处理顺序: TDST 取消 → 计数判定 → 完成判定。
+
+        参数:
+            prev_2_low / prev_2_high: 当前 bar 的 t-2 K 线的 low/high；若不足则 None
+            prev_close              : 当前 bar 的 t-1 K 线的 close；若不足则 None
+
+        返回:
+            事件列表（按发生顺序），每个元素为 dict:
+                {"type": "PROGRESS"|"PLUS_TENTATIVE"|"COMPLETE"|"CANCEL", ...}
         """
-        match (self.sd, self.sc):
-            case (0,0):
-                # q0状态
-                self.setup_list.clear()
-            case (-1,0):
-                # q1状态
-                self.setup_list.clear()
-            case (1,1):
-                # q2状态
-                self.setup_list.clear()
-                self.setup_list.append(self.last_datetime)
-            case (1,c) if c >= 2 and c <= 8:
-                # q3状态
-                self.setup_list.append(self.last_datetime)
-            case (1,9):
-                # q4状态
-                self.setup_list.append(self.last_datetime)
-                if self.setup_list.__len__() != 9:
-                    raise ValueError("setup_list length is not 9 | setup_list={},check setup machine logic".format(self.setup_list))
-                # TODO: 判断是否是完美setup，并输出Buy Setup或完美Buy Setup信号
-                # 将 Buy Setup 及其对应的 Bar 详情写入 CSV
-                self._append_current_setup_to_csv("BUYSETUP")
-            case (1,0):
-                # q5状态
-                self.setup_list.clear()
-            case (-1,1):
-                # q6状态
-                self.setup_list.clear()
-                self.setup_list.append(self.last_datetime)
-            case (-1,c) if c >= 2 and c <= 8:
-                # q7状态
-                self.setup_list.append(self.last_datetime)
-            case (-1,9):
-                # q8状态
-                self.setup_list.append(self.last_datetime)
-                if self.setup_list.__len__() != 9:
-                    raise ValueError("setup_list length is not 9 | setup_list={},check setup machine logic".format(self.setup_list))
-                # TODO: 判断是否是完美setup，并输出Sell Setup或完美Sell Setup信号
-                # 将 Sell Setup 及其对应的 Bar 详情写入 CSV
-                self._append_current_setup_to_csv("SELLSETUP")
-            case _:
-                raise ValueError("invalid state | sd={}, sc={}".format(self.sd, self.sc))
-    
+        events = []
+
+        if self.completed or self.cancelled:
+            return events
+
+        # (1) TDST 取消
+        if self._check_tdst_break(bar, prev_close):
+            self.cancelled = True
+            self.cancel_reason = "tdst_break_rule_{}".format(self.config.get("tdst_cancel_rule", 4))
+            events.append({
+                "type": "CANCEL",
+                "reason": self.cancel_reason,
+                "bar": bar,
+                "count": self.count,
+                "direction": self.direction,
+            })
+            return events
+
+        # (2) 一般计数条件
+        meets_general = False
+        if prev_2_low is not None and prev_2_high is not None:
+            if self.direction == 1:
+                meets_general = bar.close <= prev_2_low
+            else:
+                meets_general = bar.close >= prev_2_high
+
+        if not meets_general:
+            return events
+
+        # (3) 完美 Countdown 进位逻辑
+        if self.count == 12 and self.config.get("require_perfect", False):
+            if self._is_perfect_13(bar):
+                self.count = 13
+                self.bars_at_count.append(bar)
+                self.completed = True
+                events.append({
+                    "type": "COMPLETE",
+                    "bar": bar,
+                    "count": 13,
+                    "direction": self.direction,
+                    "perfect": True,
+                })
+            else:
+                # 不进位，仅记录 "+"
+                self.last_plus_dt = bar.datetime
+                events.append({
+                    "type": "PLUS_TENTATIVE",
+                    "bar": bar,
+                    "count": 12,
+                    "direction": self.direction,
+                })
+            return events
+
+        # 正常进位
+        self.count += 1
+        self.bars_at_count.append(bar)
+        if self.count >= 13:
+            self.completed = True
+            events.append({
+                "type": "COMPLETE",
+                "bar": bar,
+                "count": 13,
+                "direction": self.direction,
+                "perfect": self._is_perfect_13(bar),
+            })
+        else:
+            events.append({
+                "type": "PROGRESS",
+                "bar": bar,
+                "count": self.count,
+                "direction": self.direction,
+            })
+        return events
+
+    # ----- 由外部强制取消（同向 / 反向 setup） -----
+    def cancel_by_setup(self, reason, trigger_bar):
+        if self.completed or self.cancelled:
+            return None
+        self.cancelled = True
+        self.cancel_reason = reason
+        return {
+            "type": "CANCEL",
+            "reason": reason,
+            "bar": trigger_bar,
+            "count": self.count,
+            "direction": self.direction,
+        }
+
+
+class TDSignalProcessor:
+    """
+    单标的信号处理器：将一段时间升序的 Bar 序列喂入 Setup → Countdown 流水线，
+    输出该序列中产生的所有信号事件。
+
+    本处理器是无状态可重建的：每天 handle_data 都重新构造一个全新的处理器，
+    将最近 N 根有效 K 线全量喂入，然后筛出"最后一根（=今日）"产生的信号即可。
+    """
+
+    def __init__(self, security, frequency, config, logger):
+        self.security = security
+        self.frequency = frequency
+        self.config = config
+        self.logger = logger
+
+        self.setup_machine = SetupMachine(security, frequency, logger)
+        self.active_countdown = None  # 当前进行中的 Countdown 实例
+
+    # ----- 主循环 -----
+    def run(self, bars):
+        """
+        bars: 时间升序的 List[Bar]（已剔除停牌/0 量）。
+        返回: 该序列中所有信号事件 List[dict]，每个事件附带 'datetime' 字段。
+        """
+        events = []
+        if not bars:
+            return events
+
+        n = len(bars)
+        if n < 5:
+            self.logger.warning(
+                "K 线数量不足以驱动 SetupMachine（需至少 5 根）",
+                security=self.security, frequency=self.frequency, count=n,
+            )
+            return events
+
+        # 从 idx=4 开始（确保 t-4 存在）
+        for i in range(4, n):
+            bar = bars[i]
+            prev_4_close = bars[i - 4].close
+            prev_close = bars[i - 1].close
+            prev_2_low = bars[i - 2].low if i >= 2 else None
+            prev_2_high = bars[i - 2].high if i >= 2 else None
+
+            # ---- (a) Setup 步进 ----
+            setup_signal = self.setup_machine.step(bar, prev_4_close)
+            if setup_signal is not None:
+                self._emit_setup_signal(setup_signal, bar, events)
+                self._handle_countdown_on_setup_complete(setup_signal, bar, events)
+
+            # ---- (b) Countdown 步进 ----
+            #   注意：Setup 完成时同根 K 线已经构造了新的 active_countdown，
+            #   按 README "包括构成 TD 买入结构的第九根 K 线"，第 9 根需要立即检查 countdown 条件。
+            if self.active_countdown is not None:
+                cd_events = self.active_countdown.step(bar, prev_2_low, prev_2_high, prev_close)
+                for ev in cd_events:
+                    self._emit_countdown_event(ev, events)
+
+                if self.active_countdown.completed or self.active_countdown.cancelled:
+                    self.active_countdown = None
+
+        return events
+
+    # ----- 内部辅助 -----
+    def _emit_setup_signal(self, setup_signal, bar, events_out):
+        type_name = "BUY_SETUP" if setup_signal["type"] == "BUY_SETUP" else "SELL_SETUP"
+        record = {
+            "datetime": bar.datetime,
+            "security": self.security,
+            "frequency": self.frequency,
+            "category": "SETUP",
+            "type": type_name + ("_PERFECT" if setup_signal["perfect"] else ""),
+            "direction": 1 if setup_signal["type"] == "BUY_SETUP" else -1,
+            "perfect": setup_signal["perfect"],
+            "extra": "setup_first_dt={}".format(setup_signal["setup_bars"][0].datetime),
+        }
+        events_out.append(record)
+        self.logger.info(
+            "Setup 完成", security=self.security, frequency=self.frequency, datetime_=bar.datetime,
+            type=record["type"], perfect=setup_signal["perfect"],
+        )
+
+    def _handle_countdown_on_setup_complete(self, setup_signal, bar, events_out):
+        """根据 setup 完成情况决定是否取消旧 countdown / 启动新 countdown。"""
+        if not self.config["countdown"].get("enabled", True):
+            return
+
+        new_dir = 1 if setup_signal["type"] == "BUY_SETUP" else -1
+
+        # 是否需要 require_perfect_for_signal 才启动 countdown？
+        # 按 README，require_perfect_for_signal 控制的是 "信号是否输出"；
+        # 这里若开启，则非完美 setup 不启动 countdown（信号本身已经在 _emit_setup_signal 输出）。
+        # 为避免歧义，单独尊重 setup.require_perfect_for_signal：
+        if self.config["setup"].get("require_perfect_for_signal", False) and not setup_signal["perfect"]:
+            return
+
+        # 取消旧 countdown
+        if self.active_countdown is not None and not (self.active_countdown.completed or self.active_countdown.cancelled):
+            old_dir = self.active_countdown.direction
+            cancel_flag = False
+            if old_dir != new_dir and self.config["countdown"].get("cancel_on_opposite_setup", True):
+                cancel_evt = self.active_countdown.cancel_by_setup("opposite_setup", bar)
+                cancel_flag = True
+            elif old_dir == new_dir and self.config["countdown"].get("cancel_on_same_setup", True):
+                cancel_evt = self.active_countdown.cancel_by_setup("same_setup", bar)
+                cancel_flag = True
+            else:
+                cancel_evt = None
+
+            if cancel_flag and cancel_evt is not None:
+                self._emit_countdown_event(cancel_evt, events_out)
+                self.active_countdown = None
+
+        # 启动新 countdown
+        if self.active_countdown is None:
+            self.active_countdown = CountdownMachine(
+                direction=new_dir,
+                setup_bars=setup_signal["setup_bars"],
+                config_countdown=self.config["countdown"],
+                logger=self.logger,
+                security=self.security,
+                frequency=self.frequency,
+            )
+            self.logger.info(
+                "Countdown 启动", security=self.security, frequency=self.frequency, datetime_=bar.datetime,
+                direction="BUY" if new_dir == 1 else "SELL",
+                tdst_threshold=self.active_countdown._tdst_threshold,
+            )
+
+    def _emit_countdown_event(self, ev, events_out):
+        dir_str = "BUY" if ev["direction"] == 1 else "SELL"
+        ev_type = ev["type"]
+        bar = ev["bar"]
+        type_name = "{}_COUNTDOWN_{}".format(dir_str, ev_type)
+        if ev_type == "COMPLETE" and ev.get("perfect"):
+            type_name = "{}_COUNTDOWN_COMPLETE_PERFECT".format(dir_str)
+
+        record = {
+            "datetime": bar.datetime,
+            "security": self.security,
+            "frequency": self.frequency,
+            "category": "COUNTDOWN",
+            "type": type_name,
+            "direction": ev["direction"],
+            "count": ev.get("count"),
+            "extra": "reason={}".format(ev.get("reason", "")) if ev_type == "CANCEL" else "",
+        }
+        events_out.append(record)
+
+        if ev_type == "PROGRESS":
+            self.logger.countdown_step(
+                "Countdown 进位",
+                security=self.security, frequency=self.frequency, datetime_=bar.datetime,
+                direction=dir_str, count=ev["count"],
+            )
+        elif ev_type == "PLUS_TENTATIVE":
+            self.logger.info(
+                "Countdown 暂记 + (满足一般条件但不满足完美)",
+                security=self.security, frequency=self.frequency, datetime_=bar.datetime, direction=dir_str,
+            )
+        elif ev_type == "COMPLETE":
+            self.logger.info(
+                "Countdown 完成",
+                security=self.security, frequency=self.frequency, datetime_=bar.datetime,
+                direction=dir_str, perfect=ev.get("perfect", False),
+            )
+        elif ev_type == "CANCEL":
+            self.logger.info(
+                "Countdown 取消",
+                security=self.security, frequency=self.frequency, datetime_=bar.datetime,
+                direction=dir_str, count=ev.get("count"), reason=ev.get("reason"),
+            )
+
+
+# =============================================================================
+# [6] 信号输出层
+# =============================================================================
+
+class SignalRecorder:
+    """
+    将信号事件追加写入 CSV 文件，以便后续离线分析。
+    所有标的共用一份 signals.csv（按行追加），文件路径位于 PTrade 研究目录下的
+    config.log.output_dir 子目录中。
+
+    职责单一：仅做持久化，不感知任何信号语义。
+    """
+
+    HEADER = "datetime,security,frequency,category,type,direction,count,extra\n"
+
+    def __init__(self, output_dir_rel, logger, enabled=True):
+        self.enabled = bool(enabled)
+        self.logger = logger
+        self.output_dir_rel = output_dir_rel
+        self.csv_full_path = _join_research_path(output_dir_rel.rstrip("/") + "/signals.csv")
+        self._header_written = False
+
+        if self.enabled:
+            try:
+                create_dir(output_dir_rel)  # noqa: F821 - PTrade 注入
+            except Exception as e:
+                self.logger.warning("create_dir 失败，将尝试直接写入", path=output_dir_rel, err=e)
+
+    def write_events(self, events):
+        if not self.enabled or not events:
+            return
+        try:
+            need_header = self._need_header()
+            mode = "a" if not need_header else "w"
+            f = open(self.csv_full_path, mode, encoding="utf-8")
+            try:
+                if need_header:
+                    f.write(self.HEADER)
+                for ev in events:
+                    line = "{},{},{},{},{},{},{},{}\n".format(
+                        ev.get("datetime", ""),
+                        ev.get("security", ""),
+                        ev.get("frequency", ""),
+                        ev.get("category", ""),
+                        ev.get("type", ""),
+                        ev.get("direction", ""),
+                        ev.get("count", "") if ev.get("count") is not None else "",
+                        ev.get("extra", ""),
+                    )
+                    f.write(line)
+            finally:
+                f.close()
+            self.logger.debug("信号已写入 CSV", count=len(events), path=self.csv_full_path)
+        except Exception as e:
+            self.logger.error("写入信号 CSV 失败", path=self.csv_full_path, err=e)
+
+    def _need_header(self):
+        if self._header_written:
+            return False
+        try:
+            f = open(self.csv_full_path, "r", encoding="utf-8")
+            try:
+                first = f.readline()
+            finally:
+                f.close()
+            if first.startswith("datetime,security,frequency,category,type,direction,count,extra"):
+                self._header_written = True
+                return False
+            return True
+        except Exception:
+            return True
+
+
+# =============================================================================
+# [7] PTrade 策略钩子
+# =============================================================================
+
+def initialize(context):
+    """
+    PTrade 在策略启动时调用一次。注意此函数中不可调用 get_history / get_price /
+    get_stock_status 等行情接口，因此所有数据获取均推迟到 before_trading_start 与
+    handle_data 中执行。本函数只做配置加载与设置类调用。
+    """
+    cfg = load_config("TDSignal/config.json")
+    g.config = cfg
+
+    log_cfg = cfg.get("log", {})
+    g.logger = StrategyLogger(
+        level=log_cfg.get("level", "INFO"),
+        verbose_state_transition=log_cfg.get("verbose_state_transition", False),
+        verbose_countdown_step=log_cfg.get("verbose_countdown_step", True),
+    )
+
+    universe_cfg = cfg["universe"]
+    g.securities = list(universe_cfg.get("securities", []))
+    set_benchmark(universe_cfg.get("benchmark", "000300.SS"))
+    set_universe(g.securities)
+
+    bt_cfg = cfg["backtest"]
+    set_slippage(slippage=float(bt_cfg.get("slippage", 0.001)))
+    set_limit_mode(bt_cfg.get("limit_mode", "UNLIMITED"))
+
+    data_cfg = cfg["data"]
+    g.frequency = data_cfg.get("frequency", "1d")
+    g.fq = data_cfg.get("fq", "pre")
+    g.lookback_count = int(data_cfg.get("lookback_count", 300))
+    g.min_required_bars = int(data_cfg.get("min_required_bars", 20))
+
+    # 数据层与信号输出层（无状态对象，可在 init 中构造）
+    g.data_fetcher = MarketDataFetcher(
+        frequency=g.frequency, fq=g.fq, lookback_count=g.lookback_count, logger=g.logger,
+    )
+    g.recorder = SignalRecorder(
+        output_dir_rel=log_cfg.get("output_dir", "TDSignal"),
+        logger=g.logger,
+        enabled=log_cfg.get("csv_output", True),
+    )
+
+    # 当日有效（非停牌）标的列表，由 before_trading_start 每日刷新
+    g.active_securities_today = list(g.securities)
+
+    g.logger.info(
+        "策略初始化完成",
+        securities=len(g.securities), frequency=g.frequency, fq=g.fq,
+        lookback=g.lookback_count, setup_perfect_only=cfg["setup"].get("require_perfect_for_signal"),
+        countdown_perfect=cfg["countdown"].get("require_perfect"),
+        tdst_rule=cfg["countdown"].get("tdst_cancel_rule"),
+    )
+
+
+def before_trading_start(context, data):
+    """
+    每日盘前刷新当日有效标的（剔除当日停牌、退市等异常标的）。
+    根据 PTrade 文档，filter_stock_by_status 仅可在 before_trading_start 内调用。
+    """
+    try:
+        active = filter_stock_by_status(g.securities, ["HALT", "DELISTING"])  # noqa: F821
+        if active is None:
+            active = list(g.securities)
+    except Exception as e:
+        g.logger.warning("filter_stock_by_status 调用失败，今日不剔除停牌/退市标的", err=e)
+        active = list(g.securities)
+
+    g.active_securities_today = list(active)
+    skipped = [s for s in g.securities if s not in active]
+    g.logger.info(
+        "盘前刷新有效标的",
+        active=len(g.active_securities_today), skipped=len(skipped),
+        skipped_list=",".join(skipped) if skipped else "-",
+    )
+
+
+def handle_data(context, data):
+    """
+    每个周期执行一次（日线策略下每日 15:00 一次）。
+    对每只当日非停牌标的：
+        1. 通过数据层拉取最近 N 根有效 K 线（前复权，跳过 volume<=0 的停牌日）
+        2. 构造一个全新的 TDSignalProcessor，从头跑完整流水线
+        3. 筛出"最后一根 K 线（即今日）"产生的信号事件
+        4. 写日志 + 持久化到 CSV
+    """
+    today_events_all = []
+
+    for security in g.active_securities_today:
+        # 二次确认当日是否停牌（保守策略）
+        try:
+            current_dt = context.blotter.current_dt
+            query_date = current_dt.strftime("%Y%m%d")
+        except Exception:
+            query_date = None
+
+        if MarketDataFetcher.is_halt_today(security, query_date):
+            g.logger.info(
+                "标的当日停牌，跳过", security=security, frequency=g.frequency, datetime_=query_date,
+            )
+            continue
+
+        # 数据层：拉取近 N 根有效 K 线
+        bars = g.data_fetcher.fetch_recent_bars(security)
+        if len(bars) < g.min_required_bars:
+            g.logger.warning(
+                "有效 K 线数量不足，跳过本周期",
+                security=security, frequency=g.frequency, valid=len(bars),
+                min_required=g.min_required_bars,
+            )
+            continue
+
+        last_dt = bars[-1].datetime
+
+        # 信号层：每日全量重算
+        processor = TDSignalProcessor(
+            security=security, frequency=g.frequency, config=g.config, logger=g.logger,
+        )
+        all_events = processor.run(bars)
+
+        # 仅关注今日产生的信号事件（最后一根 K 线 datetime）
+        today_events = [ev for ev in all_events if ev["datetime"] == last_dt]
+
+        g.logger.debug(
+            "本周期事件统计",
+            security=security, frequency=g.frequency, datetime_=last_dt,
+            historical_events=len(all_events) - len(today_events),
+            today_events=len(today_events),
+        )
+
+        if today_events:
+            for ev in today_events:
+                g.logger.info(
+                    "TODAY SIGNAL",
+                    security=ev["security"], frequency=ev["frequency"], datetime_=ev["datetime"],
+                    type=ev["type"], direction=ev["direction"], count=ev.get("count"),
+                    extra=ev.get("extra", ""),
+                )
+            today_events_all.extend(today_events)
+
+    if today_events_all:
+        g.recorder.write_events(today_events_all)
+
+
+def after_trading_end(context, data):
+    """盘后留作汇总日志。当前不做交易，仅打印当日产生的信号数量。"""
+    g.logger.debug("盘后处理完毕")
