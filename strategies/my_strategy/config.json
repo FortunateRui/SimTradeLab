@@ -52,6 +52,6 @@
         "verbose_state_transition": false,
         "verbose_countdown_step": true,
         "csv_output": true,
-        "output_dir": "TDSignal"
+        "output_dir": "TD913_xiongrui"
     }
 }

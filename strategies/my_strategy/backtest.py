@@ -75,7 +75,7 @@ DEFAULT_CONFIG = {
         "verbose_state_transition": False,
         "verbose_countdown_step": True,
         "csv_output": True,
-        "output_dir": "TDSignal",
+        "output_dir": "TD913_xiongruis",
     },
 }
 
@@ -1299,7 +1299,7 @@ def initialize(context):
     get_stock_status 等行情接口，因此所有数据获取均推迟到 before_trading_start 与
     handle_data 中执行。本函数只做配置加载与设置类调用。
     """
-    cfg = load_config("TDSignal/config.json")
+    cfg = load_config("TD913_xiongrui/config.json")
     g.config = cfg
     g.run_tag = _make_run_tag(context)
 
@@ -1330,13 +1330,13 @@ def initialize(context):
         frequency=g.frequency, fq=g.fq, lookback_count=g.lookback_count, logger=g.logger,
     )
     g.recorder = SignalRecorder(
-        output_dir_rel=log_cfg.get("output_dir", "TDSignal"),
+        output_dir_rel=log_cfg.get("output_dir", "TD913_xiongrui"),
         logger=g.logger,
         run_tag=g.run_tag,
         enabled=log_cfg.get("csv_output", True),
     )
     g.log_file_path = _join_research_path(
-        log_cfg.get("output_dir", "TDSignal").rstrip("/") + "/{}.log".format(g.run_tag)
+        log_cfg.get("output_dir", "TD913_xiongrui").rstrip("/") + "/{}.log".format(g.run_tag)
     )
     g.logger.set_log_file(g.log_file_path)
     g.trade_executor = TradeExecutor(
