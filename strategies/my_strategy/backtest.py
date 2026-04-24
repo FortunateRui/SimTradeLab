@@ -1725,6 +1725,12 @@ def before_trading_start(context, data):
     根据 PTrade 文档，filter_stock_by_status 仅可在 before_trading_start 内调用。
     """
     try:
+        trading_dt = context.blotter.current_dt
+    except Exception:
+        trading_dt = getattr(context, "current_dt", None)
+    g.logger.info("盘前开始", trading_date=_format_dt(trading_dt, DATE_FMT))
+
+    try:
         active = filter_stock_by_status(g.securities, ["HALT", "DELISTING"])  # noqa: F821
         if active is None:
             active = list(g.securities)
