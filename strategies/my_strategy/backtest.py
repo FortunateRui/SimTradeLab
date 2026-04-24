@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 策略名: TD_9_13_Sequential_Signal
-功能:   基于 TD 9-13 Sequential 的信号识别（仅识别 Setup / Countdown 信号，不下单交易）
+功能:   基于 TD 9-13 Sequential 的信号识别 + 简单交易执行
 环境:   PTrade 回测 / 交易引擎
 
 模块结构（单文件，按层划分；除 config.json 外不依赖任何其它本地文件）:
@@ -11,7 +11,8 @@
     [4] 数据层                Bar / MarketDataFetcher
     [5] 信号层                SetupMachine / CountdownMachine / TDSignalProcessor
     [6] 信号输出层            SignalRecorder
-    [7] PTrade 策略钩子层     initialize / before_trading_start / handle_data / after_trading_end
+    [7] 交易执行层            TradeExecutor
+    [8] PTrade 策略钩子层     initialize / before_trading_start / handle_data / after_trading_end
 
 设计要点:
     * 数据层与信号层完全解耦：信号层只接受 Bar 序列，不感知数据来源；数据层只负责
@@ -22,6 +23,7 @@
     * 仅在 PTrade 接口允许的钩子内调用对应接口（如 get_history / get_price 不能
       在 initialize 中调用，所有数据获取放在 before_trading_start / handle_data）。
     * 周期统一：本策略不支持混合频率，统一使用 config.data.frequency。
+    * 简单交易策略：当日出现 Countdown 完成信号时，按总资产的 1/10 执行对应方向交易。
 """
 
 import json
@@ -61,6 +63,12 @@ DEFAULT_CONFIG = {
         "tdst_cancel_rule": 4,       # 1~5
         "cancel_on_opposite_setup": True,
         "cancel_on_same_setup": True,
+    },
+    "trade": {
+        "enabled": True,
+        "fraction_of_total_value": 0.1,   # 每次交易目标金额 = 总资产 * 该比例
+        "min_trade_value": 1000,          # 交易最小金额，小于该金额则跳过
+        "min_cash_for_buy": 1000,         # 可用现金低于该值，视为“近似满仓”，禁止买入
     },
     "log": {
         "level": "INFO",
@@ -148,6 +156,7 @@ class StrategyLogger:
         self.level = self.LEVEL_ORDER.get(str(level).upper(), 20)
         self.verbose_state_transition = bool(verbose_state_transition)
         self.verbose_countdown_step = bool(verbose_countdown_step)
+        self.log_file_path = None
 
     def _enabled(self, level_name):
         return self.LEVEL_ORDER[level_name] >= self.level
@@ -173,6 +182,25 @@ class StrategyLogger:
         line = "[TD]{} {}{}".format(ctx, message, self._fmt_kv(kvs))
         method = getattr(log, level_name.lower(), log.info)  # noqa: F821
         method(line)
+        self._append_to_file(line)
+
+    def set_log_file(self, log_file_path):
+        """绑定日志文件路径；之后所有日志会在控制台与文件双写。"""
+        self.log_file_path = log_file_path
+
+    def _append_to_file(self, line):
+        """将单行日志追加写入 .log 文件。失败不影响主流程。"""
+        if not self.log_file_path:
+            return
+        try:
+            f = open(self.log_file_path, "a", encoding="utf-8")
+            try:
+                f.write(line + "\n")
+            finally:
+                f.close()
+        except Exception:
+            # 文件日志失败时静默，避免日志系统反向影响策略执行
+            return
 
     def debug(self, message, **kw):
         self._emit("DEBUG", message, **kw)
@@ -1021,19 +1049,20 @@ class TDSignalProcessor:
 class SignalRecorder:
     """
     将信号事件追加写入 CSV 文件，以便后续离线分析。
-    所有标的共用一份 signals.csv（按行追加），文件路径位于 PTrade 研究目录下的
-    config.log.output_dir 子目录中。
+    所有标的共用一份 CSV（按行追加），文件路径位于 PTrade 研究目录下的
+    config.log.output_dir 子目录中，文件名按 run_tag 命名。
 
     职责单一：仅做持久化，不感知任何信号语义。
     """
 
     HEADER = "datetime,security,frequency,category,type,direction,count,extra\n"
 
-    def __init__(self, output_dir_rel, logger, enabled=True):
+    def __init__(self, output_dir_rel, logger, run_tag, enabled=True):
         self.enabled = bool(enabled)
         self.logger = logger
         self.output_dir_rel = output_dir_rel
-        self.csv_full_path = _join_research_path(output_dir_rel.rstrip("/") + "/signals.csv")
+        self.run_tag = str(run_tag)
+        self.csv_full_path = _join_research_path(output_dir_rel.rstrip("/") + "/{}.signals.csv".format(self.run_tag))
         self._header_written = False
 
         if self.enabled:
@@ -1087,8 +1116,181 @@ class SignalRecorder:
             return True
 
 
+def _make_run_tag(context):
+    """
+    生成本次策略运行的文件前缀（策略启动 datetime）。
+    优先使用 context.blotter.current_dt；失败则退化到当前交易日 + 000000。
+    """
+    try:
+        dt = context.blotter.current_dt
+        return dt.strftime("%Y%m%d%H%M%S")
+    except Exception:
+        pass
+    try:
+        td = get_trading_day(0)  # noqa: F821 - PTrade 注入
+        return "{}000000".format(td.strftime("%Y%m%d"))
+    except Exception:
+        return "unknown_start_dt"
+
+
 # =============================================================================
-# [7] PTrade 策略钩子
+# [7] 交易执行层
+# =============================================================================
+
+class TradeExecutor:
+    """
+    交易执行层：只依赖当日信号事件，不关心信号计算细节。
+
+    当前策略（简单版）:
+      * 当天出现 BUY_COUNTDOWN_COMPLETE* 事件 -> 买入总资产的 1/10
+      * 当天出现 SELL_COUNTDOWN_COMPLETE* 事件 -> 卖出总资产的 1/10
+
+    必要检查:
+      * 空仓时不支持卖出
+      * 满仓（可用现金不足）时不支持买入
+    """
+
+    def __init__(self, cfg_trade, logger):
+        self.enabled = bool(cfg_trade.get("enabled", True))
+        self.fraction = float(cfg_trade.get("fraction_of_total_value", 0.1))
+        self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
+        self.min_cash_for_buy = float(cfg_trade.get("min_cash_for_buy", 1000))
+        self.logger = logger
+
+    def execute_for_events(self, context, data, security, today_events):
+        if not self.enabled or not today_events:
+            return
+
+        # 仅处理当日 countdown 完成信号
+        completion_events = []
+        for ev in today_events:
+            if ev.get("category") != "COUNTDOWN":
+                continue
+            ev_type = ev.get("type", "")
+            if ev_type.startswith("BUY_COUNTDOWN_COMPLETE") or ev_type.startswith("SELL_COUNTDOWN_COMPLETE"):
+                completion_events.append(ev)
+
+        if not completion_events:
+            return
+
+        for ev in completion_events:
+            self._execute_single_event(context, data, security, ev)
+
+    def _execute_single_event(self, context, data, security, ev):
+        direction = int(ev.get("direction", 0))
+        if direction not in (1, -1):
+            self.logger.warning("交易方向非法，跳过", security=security, direction=direction, event_type=ev.get("type"))
+            return
+
+        total_value = self._safe_float(getattr(getattr(context, "portfolio", None), "total_value", 0.0))
+        available_cash = self._safe_float(getattr(getattr(context, "portfolio", None), "available_cash", 0.0))
+        target_trade_value = total_value * self.fraction
+
+        if target_trade_value < self.min_trade_value:
+            self.logger.info(
+                "交易金额过小，跳过",
+                security=security, event_type=ev.get("type"),
+                trade_value=round(target_trade_value, 2), min_trade_value=self.min_trade_value,
+            )
+            return
+
+        pos_qty, pos_value = self._get_position_snapshot(security)
+        # 买入前检查：近似满仓（可用现金不足）
+        if direction == 1 and available_cash < self.min_cash_for_buy:
+            self.logger.info(
+                "满仓或现金不足，禁止买入",
+                security=security, event_type=ev.get("type"),
+                available_cash=round(available_cash, 2), min_cash_for_buy=self.min_cash_for_buy,
+            )
+            return
+
+        # 卖出前检查：空仓
+        if direction == -1 and pos_qty <= 0 and pos_value <= 0:
+            self.logger.info(
+                "空仓状态，禁止卖出",
+                security=security, event_type=ev.get("type"),
+                position_qty=pos_qty, position_value=round(pos_value, 2),
+            )
+            return
+
+        # 下单金额约束
+        if direction == 1:
+            actual_value = min(target_trade_value, available_cash)
+            if actual_value < self.min_trade_value:
+                self.logger.info(
+                    "可买金额不足最小门槛，跳过",
+                    security=security, event_type=ev.get("type"),
+                    actual_value=round(actual_value, 2), min_trade_value=self.min_trade_value,
+                )
+                return
+            order_value(security, actual_value)  # noqa: F821 - PTrade 注入
+            self.logger.info(
+                "执行买入",
+                security=security, event_type=ev.get("type"),
+                total_value=round(total_value, 2), available_cash=round(available_cash, 2),
+                target_trade_value=round(target_trade_value, 2), actual_trade_value=round(actual_value, 2),
+            )
+            return
+
+        # direction == -1
+        actual_value = min(target_trade_value, max(pos_value, 0.0))
+        if actual_value < self.min_trade_value:
+            self.logger.info(
+                "可卖金额不足最小门槛，跳过",
+                security=security, event_type=ev.get("type"),
+                actual_value=round(actual_value, 2), min_trade_value=self.min_trade_value,
+            )
+            return
+        order_value(security, -actual_value)  # noqa: F821 - PTrade 注入
+        self.logger.info(
+            "执行卖出",
+            security=security, event_type=ev.get("type"),
+            total_value=round(total_value, 2),
+            position_qty=pos_qty, position_value=round(pos_value, 2),
+            target_trade_value=round(target_trade_value, 2), actual_trade_value=round(actual_value, 2),
+        )
+
+    @staticmethod
+    def _safe_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    def _get_position_snapshot(self, security):
+        """
+        返回 (仓位数量, 仓位市值)，兼容不同柜台字段命名。
+        """
+        try:
+            pos = get_position(security)  # noqa: F821 - PTrade 注入
+        except Exception:
+            pos = None
+        if pos is None:
+            return 0.0, 0.0
+
+        qty_candidates = [
+            "current_amount", "total_amount", "enable_amount", "amount", "volume", "qty",
+        ]
+        value_candidates = [
+            "market_value", "position_value", "value", "cost_balance",
+        ]
+        qty = 0.0
+        for k in qty_candidates:
+            if hasattr(pos, k):
+                qty = self._safe_float(getattr(pos, k, 0.0))
+                if qty > 0:
+                    break
+        pos_value = 0.0
+        for k in value_candidates:
+            if hasattr(pos, k):
+                pos_value = self._safe_float(getattr(pos, k, 0.0))
+                if pos_value > 0:
+                    break
+        return qty, pos_value
+
+
+# =============================================================================
+# [8] PTrade 策略钩子
 # =============================================================================
 
 def initialize(context):
@@ -1099,6 +1301,7 @@ def initialize(context):
     """
     cfg = load_config("TDSignal/config.json")
     g.config = cfg
+    g.run_tag = _make_run_tag(context)
 
     log_cfg = cfg.get("log", {})
     g.logger = StrategyLogger(
@@ -1129,7 +1332,16 @@ def initialize(context):
     g.recorder = SignalRecorder(
         output_dir_rel=log_cfg.get("output_dir", "TDSignal"),
         logger=g.logger,
+        run_tag=g.run_tag,
         enabled=log_cfg.get("csv_output", True),
+    )
+    g.log_file_path = _join_research_path(
+        log_cfg.get("output_dir", "TDSignal").rstrip("/") + "/{}.log".format(g.run_tag)
+    )
+    g.logger.set_log_file(g.log_file_path)
+    g.trade_executor = TradeExecutor(
+        cfg_trade=cfg.get("trade", {}),
+        logger=g.logger,
     )
 
     # 当日有效（非停牌）标的列表，由 before_trading_start 每日刷新
@@ -1141,6 +1353,11 @@ def initialize(context):
         lookback=g.lookback_count, setup_perfect_only=cfg["setup"].get("require_perfect_for_signal"),
         countdown_perfect=cfg["countdown"].get("require_perfect"),
         tdst_rule=cfg["countdown"].get("tdst_cancel_rule"),
+        trade_enabled=cfg.get("trade", {}).get("enabled", True),
+        trade_fraction=cfg.get("trade", {}).get("fraction_of_total_value", 0.1),
+        run_tag=g.run_tag,
+        log_file=g.log_file_path,
+        signal_csv=g.recorder.csv_full_path,
     )
 
 
@@ -1227,6 +1444,13 @@ def handle_data(context, data):
                     type=ev["type"], direction=ev["direction"], count=ev.get("count"),
                     extra=ev.get("extra", ""),
                 )
+            # 交易层：仅基于当日 countdown 完成信号下单
+            g.trade_executor.execute_for_events(
+                context=context,
+                data=data,
+                security=security,
+                today_events=today_events,
+            )
             today_events_all.extend(today_events)
 
     if today_events_all:

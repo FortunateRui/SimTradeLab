@@ -30,8 +30,8 @@ if __name__ == '__main__':
     config = BacktestConfig(
     strategy_name='my_strategy',
     # strategy_name='5mv',
-    start_date='2025-01-01',
-    end_date='2025-12-31',
+    start_date='2023-03-13',
+    end_date='2025-03-13',
     initial_capital=1000000.0,  # 初始资金
     frequency='1d',       # '1d' 日线回测（默认），'1m' 分钟回测
     benchmark_code='000300.SS',  # 基准指数（默认沪深300）
