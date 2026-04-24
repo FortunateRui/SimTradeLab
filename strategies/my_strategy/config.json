@@ -47,11 +47,17 @@
         "_reserved_termination": "TD Termination Count（TD 终结计数），后续更新中加入此功能"
     },
 
+    "trade": {
+        "enabled": true,
+        "fraction_of_total_value": 0.1,
+        "min_trade_value": 1000,
+        "min_cash_for_buy": 1000
+    },
+
     "log": {
         "level": "INFO",
         "verbose_state_transition": false,
         "verbose_countdown_step": true,
-        "csv_output": true,
-        "output_dir": "TD913_xiongrui"
+        "csv_output": true
     }
 }
