@@ -66,8 +66,7 @@ reports/
 logs/
 backtest*.json
 
-*.png
-!docs/sponsor/*.png
+
 *.gz
 CLAUDE.md
 GEMINI.md
