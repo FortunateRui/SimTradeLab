@@ -154,11 +154,13 @@ class StrategyLogger:
 
     @staticmethod
     def _fmt_kv(kvs):
+        """格式化键值对为字符串，便于日志输出"""
         if not kvs:
             return ""
         return " | " + " ".join("{}={}".format(k, v) for k, v in kvs.items())
 
     def _emit(self, level_name, message, security=None, frequency=None, datetime_=None, **kvs):
+        """发出日志，根据级别与开关筛选"""
         if not self._enabled(level_name):
             return
         ctx = ""
@@ -215,6 +217,7 @@ class Bar:
         self.amount = None if amount is None else float(amount)
 
     def __repr__(self):
+        """返回 Bar 对象的字符串表示。"""
         return "<Bar {} O:{:.2f} H:{:.2f} L:{:.2f} C:{:.2f} V:{:.0f}>".format(
             self.datetime, self.open, self.high, self.low, self.close, self.volume
         )
@@ -339,8 +342,8 @@ SETUP_STATE_NAME = {
 
 class SetupMachine:
     """
-    Setup 子状态机。完全复用原项目的状态转移图，仅做了如下解耦改造：
-      * 不再依赖 BarsManager；输入仅为 (bar, prev_4_close)。
+    Setup 子状态机
+      * 输入仅为 (bar, prev_4_close)。
       * 状态完成时把 setup_bars（最近 9 根 K 线对象）暴露给上层，便于 Countdown 计算 TDST 等。
 
     判定规则:
