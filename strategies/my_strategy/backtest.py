@@ -32,8 +32,9 @@
     * 简单交易策略：昨日出现 Countdown 完成信号时，按总资产的 1/10 执行对应方向交易。
 """
 
-import os
 import json
+# 注意：PTrade 禁止 import os / import sys。所有文件/目录操作必须通过
+# 内置 open()、PTrade 注入的 create_dir / get_research_path 完成。
 
 
 # =============================================================================
@@ -111,16 +112,29 @@ def _validate_config_schema(cfg):
         raise ValueError("config.universe.securities 必须是非空列表")
 
 
+def _file_exists(abs_path):
+    """
+    PTrade 禁用 os 模块，这里通过尝试 open 来判定目标文件是否存在且可读。
+    仅用于文件，不用于目录。
+    """
+    try:
+        f = open(abs_path, "r", encoding="utf-8")
+        f.close()
+        return True
+    except Exception:
+        return False
+
+
 def load_config(config_rel_path):
     """
     强制读取并校验 config.json。文件不存在或内容非法时直接抛异常，不再使用
     内置默认值兜底（避免"看似成功实则走错"）。
     """
     full_path = _join_research_path(config_rel_path)
-    if not os.path.exists(full_path):
-        raise FileNotFoundError("配置文件不存在: {}".format(full_path))
-
-    f = open(full_path, "r", encoding="utf-8")
+    try:
+        f = open(full_path, "r", encoding="utf-8")
+    except Exception as e:
+        raise FileNotFoundError("配置文件不存在或不可读: {} | err={}".format(full_path, e))
     try:
         cfg = json.load(f)
     finally:
@@ -141,45 +155,70 @@ def _strip_underscore_keys(obj):
     return obj
 
 
+# 本次运行创建的输出目录内会写入此标记文件，后续启动可凭它识别"目录已被占用"。
+_RUN_MARKER_NAME = ".initialized"
+# 最多尝试的递增后缀数量，避免极端情况下死循环。
+_MAX_DIR_SUFFIX_TRIES = 1000
+
+
 def prepare_output_dir(start_date_str, config_rel_path):
     """
     在 config 同级目录下，基于"策略启动日期"创建一个全新的输出目录，用于存放
-    本次运行的 .log 与 .csv。若同名目录已存在，依次尝试追加 _1、_2、... 直到
-    得到一个不存在的目录名。
+    本次运行的 .log 与 .csv。若同名目录已存在（以标记文件判定），依次追加
+    _1、_2、... 直到得到一个全新的目录名。
+
+    由于 PTrade 禁用 os 模块，这里仅使用 PTrade 的 create_dir + 内置 open：
+        * 是否占用：尝试读取目录下的 .initialized 标记文件；读到即视为已占用
+        * 创建目录：调用 PTrade 注入的 create_dir(rel)
+        * 占用目录：写入 .initialized，下次其它 run 就能看到
 
     返回:
-        (rel_dir, abs_dir) 二元组。rel_dir 相对研究目录；abs_dir 为绝对/本地路径。
+        (rel_dir, abs_dir) 二元组。rel_dir 相对研究目录；abs_dir 为绝对路径。
     """
     parent_rel, _ = _split_parent_rel(config_rel_path)
     base_name = start_date_str
     parent_abs = _join_research_path(parent_rel).rstrip("/\\")
 
-    # 父目录必须存在（即 config 所在目录）
-    if not os.path.exists(parent_abs):
+    # 先尝试确保父目录存在（与 config.json 同级）。如果本来就存在，
+    # PTrade 的 create_dir 一般也会静默返回。
+    if parent_rel:
         try:
-            os.makedirs(parent_abs, exist_ok=True)
+            create_dir(parent_rel)  # noqa: F821 - PTrade 注入
         except Exception:
             pass
 
-    candidate = base_name
-    abs_candidate = parent_abs + "/" + candidate
-    suffix = 1
-    while os.path.exists(abs_candidate):
-        candidate = "{}_{}".format(base_name, suffix)
-        abs_candidate = parent_abs + "/" + candidate
-        suffix += 1
+    for suffix in range(0, _MAX_DIR_SUFFIX_TRIES):
+        candidate = base_name if suffix == 0 else "{}_{}".format(base_name, suffix)
+        candidate_rel = (parent_rel + "/" + candidate) if parent_rel else candidate
+        candidate_abs = parent_abs + "/" + candidate
 
-    try:
-        os.makedirs(abs_candidate, exist_ok=False)
-    except Exception:
-        # 退化：尝试 PTrade 的 create_dir（仅当 os.makedirs 不可用时）
+        # 目录中已有 .initialized 标记 → 说明是之前某一次运行留下来的
+        if _file_exists(candidate_abs + "/" + _RUN_MARKER_NAME):
+            continue
+
+        # 试着创建目录（若已存在且为空，PTrade 的 create_dir 一般不会抛错；
+        # 若抛错则视为创建失败，尝试下一个后缀）。
         try:
-            create_dir((parent_rel + "/" + candidate) if parent_rel else candidate)  # noqa: F821
+            create_dir(candidate_rel)  # noqa: F821 - PTrade 注入
+        except Exception:
+            # 创建失败一般意味着该名字已被占用但没有 .initialized —— 跳过
+            continue
+
+        # 标记这个目录为"本次运行占用"。marker 写入失败不致命，最多下次同日运行覆盖。
+        try:
+            mf = open(candidate_abs + "/" + _RUN_MARKER_NAME, "w", encoding="utf-8")
+            try:
+                mf.write("run_start={}\nsuffix={}\n".format(start_date_str, suffix))
+            finally:
+                mf.close()
         except Exception:
             pass
 
-    rel_dir = (parent_rel + "/" + candidate) if parent_rel else candidate
-    return rel_dir, abs_candidate
+        return candidate_rel, candidate_abs
+
+    # 兜底：超出尝试上限仍未成功，退化为不带后缀，交由 PTrade 决定
+    fallback_rel = (parent_rel + "/" + base_name) if parent_rel else base_name
+    return fallback_rel, parent_abs + "/" + base_name
 
 
 # =============================================================================
