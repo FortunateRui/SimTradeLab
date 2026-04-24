@@ -932,10 +932,7 @@ class TDSignalProcessor:
 
         new_dir = 1 if setup_signal["type"] == "BUY_SETUP" else -1
 
-        # 是否需要 require_perfect_for_signal 才启动 countdown？
-        # 按 README，require_perfect_for_signal 控制的是 "信号是否输出"；
-        # 这里若开启，则非完美 setup 不启动 countdown（信号本身已经在 _emit_setup_signal 输出）。
-        # 为避免歧义，单独尊重 setup.require_perfect_for_signal：
+        # 根据配置决定是否需要完美 setup 才启动 countdown
         if self.config["setup"].get("require_perfect_for_signal", False) and not setup_signal["perfect"]:
             return
 
