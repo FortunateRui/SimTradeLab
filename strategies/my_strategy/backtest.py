@@ -439,60 +439,123 @@ class SetupMachine:
         return signal
 
     def _transit(self, state, inp):
-        """根据当前状态和输入返回新状态 (sd, sc)。原项目 FSM 的等价实现。"""
+        """
+        根据当前状态和输入返回新状态 (sd, sc)。每个 q 状态独立成块，
+        每种输入（BS / SS / EQ）显式分支，便于与状态机图直接对照。
+        """
         sd, sc = state
 
-        # q0
+        # ===== q0: 初始/重置状态 =====
         if (sd, sc) == (0, 0):
-            return (1, 0) if inp == "BS" else (-1, 0) if inp == "SS" else (0, 0)
-        # q1
-        if (sd, sc) == (-1, 0):
-            return (1, 1) if inp == "BS" else (-1, 0) if inp == "SS" else (0, 0)
-        # q2
-        if (sd, sc) == (1, 1):
-            return (1, 2) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
-        # q3 (buy setup ongoing 2..8)
-        if sd == 1 and 2 <= sc <= 8:
-            return (1, sc + 1) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
-        # q4 (buy setup done)
-        if (sd, sc) == (1, 9):
-            return (1, 0) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
-        # q5 (post buy setup)
-        if (sd, sc) == (1, 0):
-            return (1, 0) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
-        # q6 (sell setup d1)
-        if (sd, sc) == (-1, 1):
-            return (1, 1) if inp == "BS" else (-1, 2) if inp == "SS" else (0, 0)
-        # q7 (sell setup ongoing 2..8)
-        if sd == -1 and 2 <= sc <= 8:
-            return (1, 1) if inp == "BS" else (-1, sc + 1) if inp == "SS" else (0, 0)
-        # q8 (sell setup done)
-        if (sd, sc) == (-1, 9):
-            return (1, 0) if inp == "BS" else (-1, 1) if inp == "SS" else (0, 0)
+            if inp == "BS":
+                return (1, 0)            # → q5（已感知到 BS 方向，但尚未启动 setup 计数）
+            if inp == "SS":
+                return (-1, 0)           # → q1
+            if inp == "EQ":
+                return (0, 0)            # 留在 q0
 
-        raise ValueError("invalid setup state: ({}, {})".format(sd, sc))
+        # ===== q1: 上一根 SS，等待方向反转 =====
+        elif (sd, sc) == (-1, 0):
+            if inp == "BS":
+                return (1, 1)            # → q2 启动 buy setup 第 1 根
+            if inp == "SS":
+                return (-1, 0)           # 留在 q1
+            if inp == "EQ":
+                return (0, 0)            # → q0
+
+        # ===== q2: buy setup 第 1 根 =====
+        elif (sd, sc) == (1, 1):
+            if inp == "BS":
+                return (1, 2)            # → q3 buy setup 第 2 根
+            if inp == "SS":
+                return (-1, 1)           # → q6 转向启动 sell setup
+            if inp == "EQ":
+                return (0, 0)            # → q0 中断
+
+        # ===== q3: buy setup 进行中（第 2~8 根） =====
+        elif sd == 1 and 2 <= sc <= 8:
+            if inp == "BS":
+                return (1, sc + 1)       # 在 q3 内累加；累加到 9 即进入 q4
+            if inp == "SS":
+                return (-1, 1)           # → q6 中断当前 buy
+            if inp == "EQ":
+                return (0, 0)            # → q0 中断
+
+        # ===== q4: buy setup 已完成（sc=9） =====
+        elif (sd, sc) == (1, 9):
+            if inp == "BS":
+                return (1, 0)            # → q5 进入 setup 后余波
+            if inp == "SS":
+                return (-1, 1)           # → q6 反向启动
+            if inp == "EQ":
+                return (0, 0)            # → q0
+
+        # ===== q5: buy setup 完成后的余波，等待方向变化 =====
+        elif (sd, sc) == (1, 0):
+            if inp == "BS":
+                return (1, 0)            # 留在 q5（继续 BS 不再产生新 setup）
+            if inp == "SS":
+                return (-1, 1)           # → q6
+            if inp == "EQ":
+                return (0, 0)            # → q0
+
+        # ===== q6: sell setup 第 1 根 =====
+        elif (sd, sc) == (-1, 1):
+            if inp == "BS":
+                return (1, 1)            # → q2 转向启动 buy setup
+            if inp == "SS":
+                return (-1, 2)           # → q7 sell setup 第 2 根
+            if inp == "EQ":
+                return (0, 0)            # → q0
+
+        # ===== q7: sell setup 进行中（第 2~8 根） =====
+        elif sd == -1 and 2 <= sc <= 8:
+            if inp == "BS":
+                return (1, 1)            # → q2 中断当前 sell
+            if inp == "SS":
+                return (-1, sc + 1)      # 在 q7 内累加；累加到 9 即进入 q8
+            if inp == "EQ":
+                return (0, 0)            # → q0
+
+        # ===== q8: sell setup 已完成（sc=9） =====
+        elif (sd, sc) == (-1, 9):
+            if inp == "BS":
+                return (1, 0)            # → q5
+            if inp == "SS":
+                return (-1, 1)           # → q6 同向重启
+            if inp == "EQ":
+                return (0, 0)            # → q0
+
+        raise ValueError("invalid setup state: ({}, {}), input={}".format(sd, sc, inp))
 
     def _apply_state_action(self, bar):
-        """根据进入的新状态维护 setup_bars，并在第 9 根完成时返回信号。"""
+        """
+        进入新状态后维护 setup_bars 并在第 9 根完成时返回信号。
+        每个 q 状态独立成块，与 _transit 一一对应。
+        """
         sd, sc = self.sd, self.sc
 
-        if (sd, sc) in ((0, 0), (-1, 0), (1, 0)):
+        # ===== q0: 重置 =====
+        if (sd, sc) == (0, 0):
             self.setup_bars = []
             return None
 
-        if (sd, sc) in ((1, 1), (-1, 1)):
-            # 新 setup 第 1 根
+        # ===== q1: SS 方向待机，清空 setup_bars =====
+        if (sd, sc) == (-1, 0):
+            self.setup_bars = []
+            return None
+
+        # ===== q2: buy setup 第 1 根，开始累积 =====
+        if (sd, sc) == (1, 1):
             self.setup_bars = [bar]
             return None
 
+        # ===== q3: buy setup 进行中（第 2~8 根），追加 =====
         if sd == 1 and 2 <= sc <= 8:
             self.setup_bars.append(bar)
             return None
 
-        if sd == -1 and 2 <= sc <= 8:
-            self.setup_bars.append(bar)
-            return None
-
+        # ===== q4: buy setup 第 9 根完成，发出 BUY_SETUP 信号 =====
         if (sd, sc) == (1, 9):
             self.setup_bars.append(bar)
             if len(self.setup_bars) != 9:
@@ -507,6 +570,22 @@ class SetupMachine:
                 "setup_bars": list(self.setup_bars),
             }
 
+        # ===== q5: buy setup 后余波，清空 setup_bars =====
+        if (sd, sc) == (1, 0):
+            self.setup_bars = []
+            return None
+
+        # ===== q6: sell setup 第 1 根，开始累积 =====
+        if (sd, sc) == (-1, 1):
+            self.setup_bars = [bar]
+            return None
+
+        # ===== q7: sell setup 进行中（第 2~8 根），追加 =====
+        if sd == -1 and 2 <= sc <= 8:
+            self.setup_bars.append(bar)
+            return None
+
+        # ===== q8: sell setup 第 9 根完成，发出 SELL_SETUP 信号 =====
         if (sd, sc) == (-1, 9):
             self.setup_bars.append(bar)
             if len(self.setup_bars) != 9:
@@ -521,7 +600,7 @@ class SetupMachine:
                 "setup_bars": list(self.setup_bars),
             }
 
-        return None
+        raise ValueError("invalid setup state after transit: ({}, {})".format(sd, sc))
 
 
 class CountdownMachine:
