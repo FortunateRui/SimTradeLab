@@ -10,7 +10,7 @@
     [3] 日志层                StrategyLogger
     [4] 数据层                Bar / MarketDataFetcher
     [5] 信号层                SetupMachine / CountdownMachine / TDSignalProcessor
-    [6] 信号与交易输出层      SignalRecorder / TradeRecorder
+    [6] 信号与交易输出层      SignalRecorder / TradeRecordRecorder
     [7] 交易执行层            TradeExecutor
     [8] PTrade 策略钩子层     initialize / before_trading_start / handle_data / after_trading_end
 
@@ -59,7 +59,11 @@ _REQUIRED_CONFIG_KEYS = {
     "backtest":    ("slippage", "limit_mode"),
     "setup":       ("require_perfect_for_signal",),
     "countdown":   ("enabled", "tdst_cancel_rule"),
-    "trade":       ("enabled", "fraction_of_total_value", "min_trade_value", "min_cash_for_buy"),
+    "trade":       (
+        "enabled", "buy_fraction_of_portfolio", "min_trade_value", "min_cash_for_buy",
+        "take_profit_on_sell_countdown", "stop_loss_enabled", "profit_target_r_multiple",
+        "require_perfect_setup_for_buy",
+    ),
     "log":         ("level",),
 }
 
@@ -1091,6 +1095,7 @@ class TDSignalProcessor:
                 "setup_perfect": setup_signal["perfect"],
                 "setup_first_dt": setup_signal["setup_bars"][0].datetime,
                 "setup_last_dt": setup_signal["setup_bars"][-1].datetime,
+                "setup_highest_high": max(b.high for b in setup_signal["setup_bars"]),
             }
             self.active_countdown = CountdownMachine(
                 direction=new_dir,
@@ -1122,6 +1127,8 @@ class TDSignalProcessor:
         setup_info = cd.setup_info if cd is not None else {}
         tdst_threshold = cd._tdst_threshold if cd is not None else None
         countdown_start_dt = cd.start_bar_dt if cd is not None else None
+        count_bars = cd.bars_at_count if cd is not None else []
+        lowest_bar = self._lowest_low_bar(count_bars)
 
         record = {
             "datetime": bar.datetime,
@@ -1138,9 +1145,19 @@ class TDSignalProcessor:
             "setup_perfect": setup_info.get("setup_perfect", ""),
             "setup_first_dt": setup_info.get("setup_first_dt", ""),
             "setup_last_dt": setup_info.get("setup_last_dt", ""),
+            "setup_highest_high": setup_info.get("setup_highest_high", ""),
             "tdst_threshold": tdst_threshold if tdst_threshold is not None else "",
             "countdown_start_dt": countdown_start_dt or "",
+            "countdown_8_close": count_bars[7].close if len(count_bars) >= 8 else "",
+            "countdown_low_dt": lowest_bar.datetime if lowest_bar is not None else "",
+            "countdown_low": lowest_bar.low if lowest_bar is not None else "",
+            "countdown_low_bar_high": lowest_bar.high if lowest_bar is not None else "",
+            "bar_close": bar.close,
+            "bar_high": bar.high,
+            "bar_low": bar.low,
         }
+        for i in range(1, 14):
+            record["count_{}_dt".format(i)] = count_bars[i - 1].datetime if len(count_bars) >= i else ""
         events_out.append(record)
 
         if ev_type == "PROGRESS":
@@ -1167,6 +1184,16 @@ class TDSignalProcessor:
                 security=self.security, frequency=self.frequency, datetime_=bar.datetime,
                 direction=dir_str, count=ev.get("count"), reason=ev.get("reason"),
             )
+
+    @staticmethod
+    def _lowest_low_bar(bars):
+        if not bars:
+            return None
+        lowest = bars[0]
+        for b in bars[1:]:
+            if b.low < lowest.low:
+                lowest = b
+        return lowest
 
 
 # =============================================================================
@@ -1197,7 +1224,12 @@ class SignalRecorder:
         "datetime", "security", "frequency", "category", "type",
         "direction", "count", "perfect", "reason",
         "setup_type", "setup_perfect", "setup_first_dt", "setup_last_dt",
-        "tdst_threshold", "countdown_start_dt",
+        "setup_highest_high", "tdst_threshold", "countdown_start_dt",
+        "count_1_dt", "count_2_dt", "count_3_dt", "count_4_dt", "count_5_dt",
+        "count_6_dt", "count_7_dt", "count_8_dt", "countdown_8_close",
+        "count_9_dt", "count_10_dt", "count_11_dt", "count_12_dt", "count_13_dt",
+        "countdown_low_dt", "countdown_low", "countdown_low_bar_high",
+        "bar_close", "bar_high", "bar_low",
     ]
 
     def __init__(self, output_dir_abs, logger, enabled=True):
@@ -1275,53 +1307,46 @@ class SignalRecorder:
         return s
 
 
-class TradeRecorder:
+class TradeRecordRecorder:
     """
-    把每一次交易决策写入单独的 CSV 文件 `trade_events.csv`。
-    无论下单成功、被风控跳过，还是金额过小，都会留一行记录，方便回溯。
+    记录一笔完整的"Buy Setup -> Buy Countdown -> 买入/未买入 -> 卖出/取消"生命周期。
+    文件按标的分流：trade_record_600519SS.csv。
 
-    字段：
-        decision_dt   : 本次决策发生时间（= handle_data 当前时间，即"今天盘中"）
-        security      : 交易标的
-        action        : BUY / SELL
-        status        : EXECUTED / SKIP_EMPTY_POSITION / SKIP_FULL_POSITION /
-                        SKIP_MIN_VALUE / SKIP_MIN_CASH / SKIP_NO_POSITION_VALUE
-        signal_type   : 触发交易的信号类型（例: BUY_COUNTDOWN_COMPLETE_PERFECT）
-        signal_bar_dt : 触发信号的 K 线时间（= 上一根已收盘 K 线）
-        count         : 信号关联的 countdown 计数
-        perfect       : 信号是否 perfect
-        setup_type / setup_perfect / setup_first_dt / setup_last_dt
-        countdown_start_dt / tdst_threshold
-        total_value   : 决策瞬间的账户总资产
-        available_cash: 决策瞬间可用现金
-        position_qty  : 决策瞬间该标的持仓数量
-        position_value: 决策瞬间该标的持仓市值
-        target_value  : 目标交易金额（= total_value * fraction）
-        actual_value  : 实际下单金额（被 cash / position 限制后）
+    只在生命周期终态写入：
+      * Buy Countdown 被取消
+      * Buy Countdown 完成但交易被取消/跳过
+      * 已买入仓位被卖出（止损、止盈、趋势反转、外部中止）
     """
 
     HEADER_FIELDS = [
-        "decision_dt", "security", "action", "status",
-        "signal_type", "signal_bar_dt", "count", "perfect",
-        "setup_type", "setup_perfect", "setup_first_dt", "setup_last_dt",
-        "countdown_start_dt", "tdst_threshold",
-        "total_value", "available_cash", "position_qty", "position_value",
-        "target_value", "actual_value",
+        "security",
+        "setup_completed_at", "setup_is_perfect", "setup_highest_high",
+        "count_1_at", "count_2_at", "count_3_at", "count_4_at", "count_5_at",
+        "count_6_at", "count_7_at", "count_8_at", "count_8_close",
+        "count_9_at", "count_10_at", "count_11_at", "count_12_at", "count_13_at",
+        "countdown_completed_count", "countdown_is_perfect", "countdown_status",
+        "bought", "buy_reject_reason", "buy_quantity", "buy_price", "buy_date",
+        "stop_loss_price", "take_profit_price",
+        "sell_price", "sell_date", "sell_reason", "pnl",
     ]
 
     def __init__(self, output_dir_abs, logger, enabled=True):
         self.enabled = bool(enabled)
         self.logger = logger
         self.output_dir_abs = output_dir_abs.rstrip("/\\")
-        self.csv_path = "{}/trade_events.csv".format(self.output_dir_abs)
-        self._header_written = False
+        self._header_written_paths = set()
+
+    def _csv_path_for(self, security):
+        return "{}/trade_record_{}.csv".format(self.output_dir_abs, _security_to_filename(security))
 
     def record(self, row):
         if not self.enabled:
             return
+        security = row.get("security", "unknown")
+        path = self._csv_path_for(security)
         try:
-            need_header = self._need_header()
-            f = open(self.csv_path, "a" if not need_header else "w", encoding="utf-8")
+            need_header = self._need_header(path)
+            f = open(path, "a" if not need_header else "w", encoding="utf-8")
             try:
                 if need_header:
                     f.write(",".join(self.HEADER_FIELDS) + "\n")
@@ -1329,21 +1354,22 @@ class TradeRecorder:
                 f.write(",".join(values) + "\n")
             finally:
                 f.close()
-            self._header_written = True
+            self._header_written_paths.add(path)
+            self.logger.debug("交易生命周期记录已写入", security=security, path=path)
         except Exception as e:
-            self.logger.error("写入交易事件 CSV 失败", path=self.csv_path, err=e)
+            self.logger.error("写入交易生命周期 CSV 失败", security=security, path=path, err=e)
 
-    def _need_header(self):
-        if self._header_written:
+    def _need_header(self, path):
+        if path in self._header_written_paths:
             return False
         try:
-            f = open(self.csv_path, "r", encoding="utf-8")
+            f = open(path, "r", encoding="utf-8")
             try:
                 first = f.readline()
             finally:
                 f.close()
             if first.startswith(",".join(self.HEADER_FIELDS[:3])):
-                self._header_written = True
+                self._header_written_paths.add(path)
                 return False
             return True
         except Exception:
@@ -1387,7 +1413,7 @@ class TradeExecutor:
 
     def __init__(self, cfg_trade, logger, trade_recorder=None):
         self.enabled = bool(cfg_trade.get("enabled", True))
-        self.fraction = float(cfg_trade.get("fraction_of_total_value", 0.1))
+        self.fraction = float(cfg_trade.get("buy_fraction_of_portfolio", 0.1))
         self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
         self.min_cash_for_buy = float(cfg_trade.get("min_cash_for_buy", 1000))
         self.logger = logger
@@ -1654,6 +1680,498 @@ class TradeExecutor:
 
 
 # =============================================================================
+# [7.1] 交易执行层（当前版本）
+# =============================================================================
+
+COUNTDOWN_STATUS_NORMAL = "NORMAL"
+COUNTDOWN_STATUS_CANCEL_TDST_PREFIX = "CANCEL_BY_TDST_RULE_"
+COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP = "CANCEL_BY_OPPOSITE_SETUP"
+COUNTDOWN_STATUS_CANCEL_SAME_SETUP = "CANCEL_BY_SAME_SETUP"
+
+BUY_REJECT_TRADE_DISABLED = "TRADE_DISABLED"
+BUY_REJECT_NON_PERFECT_SETUP = "NON_PERFECT_SETUP"
+BUY_REJECT_ALREADY_OPEN_POSITION = "ALREADY_OPEN_POSITION"
+BUY_REJECT_INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
+BUY_REJECT_MIN_TRADE_VALUE = "MIN_TRADE_VALUE"
+BUY_REJECT_ORDER_REJECTED = "ORDER_REJECTED"
+BUY_REJECT_ORDER_ERROR = "ORDER_ERROR"
+
+SELL_REASON_STOP_LOSS = "STOP_LOSS"
+SELL_REASON_PROFIT_TARGET = "PROFIT_TARGET"
+SELL_REASON_TREND_REVERSAL = "TREND_REVERSAL"
+SELL_REASON_EXTERNAL_ABORT = "EXTERNAL_ABORT"
+
+
+class TradeExecutor:
+    """
+    当前交易策略：
+      * 默认只根据 BUY_COUNTDOWN_COMPLETE 买入；
+      * 每次买入总资产 buy_fraction_of_portfolio；
+      * SELL_COUNTDOWN_COMPLETE 默认只保留信号，不用于卖出；
+      * 若 take_profit_on_sell_countdown=true，则出现 SELL_COUNTDOWN_COMPLETE 且仓位盈利时卖出；
+      * 买入后设置 stop_loss_price 与 take_profit_price；
+      * 实盘环境用 on_trade_response 确认买入成交后建立风控仓位，tick_data 中追踪止盈止损；
+      * 回测环境降级为：order_value 返回订单后按当前持仓快照近似确认成交，
+        并在后续 handle_data 的上一根已完成 K 线上用 high/low 判断止盈止损。
+    """
+
+    def __init__(self, cfg_trade, logger, trade_recorder=None):
+        self.enabled = bool(cfg_trade.get("enabled", True))
+        self.buy_fraction = float(cfg_trade.get("buy_fraction_of_portfolio", 0.1))
+        self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
+        self.min_cash_for_buy = float(cfg_trade.get("min_cash_for_buy", 1000))
+        self.take_profit_on_sell_countdown = bool(cfg_trade.get("take_profit_on_sell_countdown", False))
+        self.stop_loss_enabled = bool(cfg_trade.get("stop_loss_enabled", True))
+        self.profit_target_r_multiple = float(cfg_trade.get("profit_target_r_multiple", 1.5))
+        self.require_perfect_setup_for_buy = bool(cfg_trade.get("require_perfect_setup_for_buy", False))
+        self.logger = logger
+        self.trade_recorder = trade_recorder
+
+        # 每个标的当前最多跟踪一笔完整交易。后续若需要金字塔/多笔并行，可扩展为 list。
+        self.open_trades = {}
+        self.pending_buy_orders = {}
+        self.pending_sell_orders = {}
+
+    def execute_for_events(self, context, security, last_bar_events):
+        if not last_bar_events:
+            return
+
+        for ev in last_bar_events:
+            if ev.get("category") != "COUNTDOWN":
+                continue
+            ev_type = ev.get("type", "")
+            direction = int(ev.get("direction", 0))
+
+            # Buy countdown 取消：生命周期在"计数取消"处结束，写一行。
+            if direction == 1 and ev_type == "BUY_COUNTDOWN_CANCEL":
+                self._record_terminal(ev, bought=False, buy_reject_reason="", countdown_status=self._countdown_status(ev))
+                continue
+
+            # Buy countdown 完成：尝试买入；若不能买，生命周期在"交易取消"处结束，写一行。
+            if direction == 1 and ev_type.startswith("BUY_COUNTDOWN_COMPLETE"):
+                self._try_buy_from_signal(context, security, ev)
+                continue
+
+            # Sell countdown 完成：默认不交易；配置开启时，仅盈利仓位趋势反转止盈。
+            if direction == -1 and ev_type.startswith("SELL_COUNTDOWN_COMPLETE"):
+                self._try_sell_on_sell_countdown(context, security, ev)
+
+    def check_backtest_exits(self, context, security, completed_bar):
+        """
+        回测降级：用上一根已完成 K 线的 high/low 判断止盈止损。
+        注意：刚根据该 completed_bar 信号买入的仓位，会把 last_checked_bar_dt 初始化为
+        signal datetime，因此不会在同一根历史 K 上立刻被止盈/止损。
+        """
+        if self._is_live_trade() or security not in self.open_trades:
+            return
+        trade = self.open_trades[security]
+        bar_dt = completed_bar.datetime
+        if trade.get("last_checked_bar_dt") and bar_dt <= trade.get("last_checked_bar_dt"):
+            return
+
+        stop_loss = self._safe_float(trade.get("stop_loss_price", 0.0))
+        take_profit = self._safe_float(trade.get("take_profit_price", 0.0))
+
+        # 同一根 K 线同时触发时，保守按先止损处理。
+        if self.stop_loss_enabled and stop_loss > 0 and completed_bar.low <= stop_loss:
+            self._sell_open_trade(context, security, stop_loss, completed_bar.datetime, SELL_REASON_STOP_LOSS)
+            return
+        if take_profit > 0 and completed_bar.high >= take_profit:
+            self._sell_open_trade(context, security, take_profit, completed_bar.datetime, SELL_REASON_PROFIT_TARGET)
+            return
+
+        trade["last_checked_bar_dt"] = bar_dt
+
+    def check_tick_exits(self, context, tick_data_obj):
+        """实盘 tick_data 中追踪止盈止损。回测环境不执行。"""
+        if not self._is_live_trade():
+            return
+        for security in list(self.open_trades.keys()):
+            price = self._extract_tick_price(tick_data_obj, security)
+            if price <= 0:
+                continue
+            trade = self.open_trades[security]
+            if self.stop_loss_enabled and price <= self._safe_float(trade.get("stop_loss_price", 0.0)):
+                self._submit_sell_order(context, security, price, SELL_REASON_STOP_LOSS)
+                continue
+            if price >= self._safe_float(trade.get("take_profit_price", 0.0)):
+                self._submit_sell_order(context, security, price, SELL_REASON_PROFIT_TARGET)
+
+    def on_trade_response(self, context, trade_response):
+        """
+        实盘成交回报：买入成交后才建立风控仓位；卖出成交后才写终态记录。
+        回测环境 is_trade()=False 时不会依赖该回调。
+        """
+        if not self._is_live_trade():
+            return
+        order_id = self._read_any(trade_response, ["order_id", "entrust_no", "order_no", "id"])
+        if not order_id:
+            return
+        order_id = str(order_id)
+
+        price = self._safe_float(self._read_any(trade_response, ["price", "business_price", "filled_price", "trade_price"]))
+        qty = self._safe_float(self._read_any(trade_response, ["amount", "business_amount", "filled_amount", "trade_amount", "volume"]))
+        trade_dt = _format_dt(self._read_any(trade_response, ["datetime", "dt", "trade_time", "business_time"]))
+
+        if order_id in self.pending_buy_orders:
+            pending = self.pending_buy_orders.pop(order_id)
+            security = pending["security"]
+            if price <= 0:
+                price = self._safe_float(pending.get("fallback_price"))
+            if qty <= 0:
+                qty = self._safe_float(pending.get("fallback_qty"))
+            self._open_trade_from_fill(security, pending["event"], price, qty, trade_dt or pending["decision_dt"])
+            return
+
+        if order_id in self.pending_sell_orders:
+            pending = self.pending_sell_orders.pop(order_id)
+            security = pending["security"]
+            if price <= 0:
+                price = self._safe_float(pending.get("fallback_price"))
+            self._finalize_sell(security, price, trade_dt or pending["sell_date"], pending["sell_reason"])
+
+    # ----- Buy side -----
+    def _try_buy_from_signal(self, context, security, ev):
+        if not self.enabled:
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_TRADE_DISABLED)
+            return
+        if security in self.open_trades:
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_ALREADY_OPEN_POSITION)
+            return
+        if self.require_perfect_setup_for_buy and not self._boolish(ev.get("setup_perfect")):
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_NON_PERFECT_SETUP)
+            return
+
+        snap = self._portfolio_snapshot(context)
+        total_value = snap["total_value"]
+        available_cash = snap["available_cash"]
+        target_value = total_value * self.buy_fraction
+
+        if target_value < self.min_trade_value:
+            self.logger.info("买入取消：目标金额低于最小交易金额", security=security, target_value=round(target_value, 2))
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_MIN_TRADE_VALUE)
+            return
+        if available_cash < self.min_cash_for_buy:
+            self.logger.info(
+                "买入取消：现金不足",
+                security=security, available_cash=round(available_cash, 2), min_cash_for_buy=self.min_cash_for_buy,
+                snapshot=snap["debug"],
+            )
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_INSUFFICIENT_CASH)
+            return
+
+        actual_value = min(target_value, available_cash)
+        if actual_value < self.min_trade_value:
+            self.logger.info("买入取消：实际可买金额低于最小交易金额", security=security, actual_value=round(actual_value, 2))
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_MIN_TRADE_VALUE)
+            return
+
+        decision_dt = _format_dt(self._current_dt(context))
+        fallback_price = self._safe_float(ev.get("bar_close"))
+        try:
+            order_id = order_value(security, actual_value)  # noqa: F821 - PTrade 注入
+        except Exception as e:
+            self.logger.error("买入 order_value 调用失败", security=security, err=e, value=actual_value)
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_ORDER_ERROR)
+            return
+        if not order_id:
+            self.logger.info("买入取消：order_value 未返回订单号", security=security, actual_value=round(actual_value, 2))
+            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_ORDER_REJECTED)
+            return
+
+        if self._is_live_trade():
+            self.pending_buy_orders[str(order_id)] = {
+                "security": security, "event": ev, "decision_dt": decision_dt,
+                "fallback_price": fallback_price, "fallback_qty": 0.0,
+            }
+            self.logger.info("买入委托已提交，等待成交回报", security=security, order_id=order_id, value=round(actual_value, 2))
+            return
+
+        # 回测降级：order_value 返回订单号后，读取持仓快照作为成交近似。
+        qty, pos_value, entry_price = self._get_position_detail(security)
+        if qty <= 0:
+            qty = int(actual_value / fallback_price / 100) * 100 if fallback_price > 0 else 0
+        if entry_price <= 0:
+            entry_price = fallback_price
+        self._open_trade_from_fill(security, ev, entry_price, qty, decision_dt)
+        self.logger.info(
+            "买入完成（回测近似成交）",
+            security=security, order_id=order_id, buy_qty=qty, buy_price=round(entry_price, 4),
+        )
+
+    def _open_trade_from_fill(self, security, ev, buy_price, buy_qty, buy_date):
+        stop_loss, take_profit = self._calc_risk_prices(ev, buy_price)
+        row = self._base_trade_record(ev, COUNTDOWN_STATUS_NORMAL)
+        row.update({
+            "bought": True,
+            "buy_reject_reason": "",
+            "buy_quantity": buy_qty,
+            "buy_price": round(buy_price, 4),
+            "buy_date": buy_date,
+            "stop_loss_price": round(stop_loss, 4) if stop_loss else "",
+            "take_profit_price": round(take_profit, 4) if take_profit else "",
+            "sell_price": "",
+            "sell_date": "",
+            "sell_reason": "",
+            "pnl": "",
+        })
+        self.open_trades[security] = row
+        self.open_trades[security]["last_checked_bar_dt"] = ev.get("datetime", "")
+
+    def _calc_risk_prices(self, ev, buy_price):
+        low = self._safe_float(ev.get("countdown_low"))
+        high = self._safe_float(ev.get("countdown_low_bar_high"))
+        if low <= 0 or high <= 0 or high < low:
+            return "", ""
+        raw_stop_loss = low - (high - low)
+        take_profit = buy_price + (buy_price - raw_stop_loss) * self.profit_target_r_multiple
+        stop_loss = raw_stop_loss if self.stop_loss_enabled else ""
+        return stop_loss, take_profit
+
+    # ----- Sell side / exits -----
+    def _try_sell_on_sell_countdown(self, context, security, ev):
+        if not self.take_profit_on_sell_countdown or security not in self.open_trades:
+            return
+        trade = self.open_trades[security]
+        ref_price = self._safe_float(ev.get("bar_close"))
+        buy_price = self._safe_float(trade.get("buy_price"))
+        if ref_price > buy_price:
+            self._sell_open_trade(context, security, ref_price, ev.get("datetime", ""), SELL_REASON_TREND_REVERSAL)
+        else:
+            self.logger.info(
+                "Sell Countdown 出现但仓位未盈利，不做趋势反转止盈",
+                security=security, ref_price=round(ref_price, 4), buy_price=round(buy_price, 4),
+            )
+
+    def _submit_sell_order(self, context, security, fallback_price, sell_reason):
+        if security not in self.open_trades or security in self.pending_sell_orders:
+            return
+        _, pos_value, _ = self._get_position_detail(security)
+        if pos_value <= 0:
+            pos_value = self._safe_float(self.open_trades[security].get("buy_price")) * self._safe_float(self.open_trades[security].get("buy_quantity"))
+        try:
+            order_id = order_value(security, -pos_value)  # noqa: F821 - PTrade 注入
+        except Exception as e:
+            self.logger.error("卖出 order_value 调用失败", security=security, err=e, value=-pos_value, reason=sell_reason)
+            return
+        if not order_id:
+            self.logger.info("卖出委托未提交", security=security, value=round(pos_value, 2), reason=sell_reason)
+            return
+        self.pending_sell_orders[str(order_id)] = {
+            "security": security,
+            "sell_reason": sell_reason,
+            "sell_date": _format_dt(self._current_dt(context)),
+            "fallback_price": fallback_price,
+        }
+
+    def _sell_open_trade(self, context, security, sell_price, sell_date, sell_reason):
+        if security not in self.open_trades:
+            return
+        if self._is_live_trade():
+            self._submit_sell_order(context, security, sell_price, sell_reason)
+            return
+        _, pos_value, _ = self._get_position_detail(security)
+        if pos_value <= 0:
+            pos_value = self._safe_float(self.open_trades[security].get("buy_price")) * self._safe_float(self.open_trades[security].get("buy_quantity"))
+        try:
+            order_id = order_value(security, -pos_value)  # noqa: F821 - PTrade 注入
+        except Exception as e:
+            self.logger.error("卖出 order_value 调用失败", security=security, err=e, value=-pos_value, reason=sell_reason)
+            return
+        if not order_id:
+            self.logger.info("卖出委托未提交", security=security, value=round(pos_value, 2), reason=sell_reason)
+            return
+        self._finalize_sell(security, sell_price, sell_date, sell_reason)
+
+    def _finalize_sell(self, security, sell_price, sell_date, sell_reason):
+        if security not in self.open_trades:
+            return
+        row = dict(self.open_trades.pop(security))
+        buy_price = self._safe_float(row.get("buy_price"))
+        qty = self._safe_float(row.get("buy_quantity"))
+        pnl = (sell_price - buy_price) * qty
+        row.update({
+            "sell_price": round(sell_price, 4),
+            "sell_date": sell_date,
+            "sell_reason": sell_reason,
+            "pnl": round(pnl, 2),
+        })
+        self.trade_recorder.record(row)
+        self.logger.info("交易生命周期结束", security=security, sell_reason=sell_reason, pnl=round(pnl, 2))
+
+    # ----- Records -----
+    def _record_terminal(self, ev, bought=False, buy_reject_reason="", countdown_status=None):
+        if self.trade_recorder is None:
+            return
+        status = countdown_status or self._countdown_status(ev)
+        row = self._base_trade_record(ev, status)
+        row.update({
+            "bought": bool(bought),
+            "buy_reject_reason": buy_reject_reason,
+            "buy_quantity": "",
+            "buy_price": "",
+            "buy_date": "",
+            "stop_loss_price": "",
+            "take_profit_price": "",
+            "sell_price": "",
+            "sell_date": "",
+            "sell_reason": "",
+            "pnl": "",
+        })
+        self.trade_recorder.record(row)
+
+    def _base_trade_record(self, ev, countdown_status):
+        return {
+            "security": ev.get("security", ""),
+            "setup_completed_at": ev.get("setup_last_dt", ""),
+            "setup_is_perfect": ev.get("setup_perfect", ""),
+            "setup_highest_high": ev.get("setup_highest_high", ""),
+            "count_1_at": ev.get("count_1_dt", ""),
+            "count_2_at": ev.get("count_2_dt", ""),
+            "count_3_at": ev.get("count_3_dt", ""),
+            "count_4_at": ev.get("count_4_dt", ""),
+            "count_5_at": ev.get("count_5_dt", ""),
+            "count_6_at": ev.get("count_6_dt", ""),
+            "count_7_at": ev.get("count_7_dt", ""),
+            "count_8_at": ev.get("count_8_dt", ""),
+            "count_8_close": ev.get("countdown_8_close", ""),
+            "count_9_at": ev.get("count_9_dt", ""),
+            "count_10_at": ev.get("count_10_dt", ""),
+            "count_11_at": ev.get("count_11_dt", ""),
+            "count_12_at": ev.get("count_12_dt", ""),
+            "count_13_at": ev.get("count_13_dt", ""),
+            "countdown_completed_count": ev.get("count", ""),
+            "countdown_is_perfect": ev.get("perfect", ""),
+            "countdown_status": countdown_status,
+        }
+
+    def _countdown_status(self, ev):
+        ev_type = ev.get("type", "")
+        if "CANCEL" not in ev_type:
+            return COUNTDOWN_STATUS_NORMAL
+        reason = ev.get("reason", "")
+        if reason.startswith("tdst_break_rule_"):
+            return COUNTDOWN_STATUS_CANCEL_TDST_PREFIX + reason.replace("tdst_break_rule_", "")
+        if reason == "opposite_setup":
+            return COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP
+        if reason == "same_setup":
+            return COUNTDOWN_STATUS_CANCEL_SAME_SETUP
+        return "CANCEL_BY_{}".format(str(reason).upper() or "UNKNOWN")
+
+    # ----- Helpers -----
+    def _portfolio_snapshot(self, context):
+        portfolio = getattr(context, "portfolio", None)
+        debug = {"has_portfolio": portfolio is not None}
+
+        def read_attr(obj, names):
+            if obj is None:
+                return None, None
+            for name in names:
+                try:
+                    if hasattr(obj, name):
+                        val = getattr(obj, name)
+                        if callable(val):
+                            val = val()
+                        return self._safe_float(val), name
+                except Exception:
+                    continue
+            return None, None
+
+        total_value, tv_src = read_attr(portfolio, ["total_value", "portfolio_value", "totalValue", "total_asset", "assets"])
+        available_cash, ac_src = read_attr(portfolio, ["available_cash", "cash", "_cash", "starting_cash"])
+        debug["total_value_from"] = tv_src
+        debug["available_cash_from"] = ac_src
+        if available_cash is None:
+            available_cash = self._safe_float(getattr(context, "capital_base", 0.0))
+            debug["available_cash_from"] = "context.capital_base"
+        if total_value is None or total_value <= 0:
+            positions_value = self._safe_float(getattr(portfolio, "positions_value", 0.0)) if portfolio else 0.0
+            total_value = available_cash + positions_value
+            debug["total_value_from"] = "cash+positions_value"
+        debug["available_cash"] = available_cash
+        debug["total_value"] = total_value
+        return {"total_value": total_value, "available_cash": available_cash, "debug": debug}
+
+    def _get_position_detail(self, security):
+        try:
+            pos = get_position(security)  # noqa: F821 - PTrade 注入
+        except Exception:
+            pos = None
+        if pos is None:
+            return 0.0, 0.0, 0.0
+        qty = self._first_attr_float(pos, ["current_amount", "total_amount", "enable_amount", "amount", "volume", "qty"])
+        value = self._first_attr_float(pos, ["market_value", "position_value", "value", "cost_balance"])
+        price = self._first_attr_float(pos, ["last_sale_price", "price", "cost_basis"])
+        if price <= 0 and qty > 0 and value > 0:
+            price = value / qty
+        return qty, value, price
+
+    def _first_attr_float(self, obj, names):
+        for k in names:
+            if hasattr(obj, k):
+                v = self._safe_float(getattr(obj, k, 0.0))
+                if v > 0:
+                    return v
+        return 0.0
+
+    @staticmethod
+    def _current_dt(context):
+        try:
+            return context.blotter.current_dt
+        except Exception:
+            pass
+        return getattr(context, "current_dt", None)
+
+    @staticmethod
+    def _safe_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _boolish(x):
+        return x is True or str(x).lower() in ("true", "1", "yes")
+
+    @staticmethod
+    def _read_any(obj, names):
+        if obj is None:
+            return None
+        for name in names:
+            try:
+                if isinstance(obj, dict) and name in obj:
+                    return obj.get(name)
+                if hasattr(obj, name):
+                    return getattr(obj, name)
+            except Exception:
+                continue
+        return None
+
+    def _extract_tick_price(self, tick_data_obj, security):
+        tick = None
+        try:
+            if isinstance(tick_data_obj, dict):
+                tick = tick_data_obj.get(security)
+        except Exception:
+            tick = None
+        if tick is None:
+            tick = tick_data_obj
+            tick_sec = self._read_any(tick, ["security", "symbol", "stock_code", "code"])
+            if tick_sec and str(tick_sec) != str(security):
+                return 0.0
+        return self._safe_float(self._read_any(tick, [
+            "last_price", "current_price", "price", "last", "close", "business_price",
+        ]))
+
+    @staticmethod
+    def _is_live_trade():
+        try:
+            return bool(is_trade())  # noqa: F821 - PTrade 注入
+        except Exception:
+            return False
+
+
+# =============================================================================
 # [8] PTrade 策略钩子
 # =============================================================================
 
@@ -1721,13 +2239,13 @@ def initialize(context):
         frequency=g.frequency, fq=g.fq, lookback_count=g.lookback_count, logger=g.logger,
     )
 
-    # (6) 信号输出层 & 交易事件输出层（per-security CSV + trade_events.csv）
+    # (6) 信号输出层 & 交易生命周期输出层（per-security CSV + trade_record_<SEC>.csv）
     g.recorder = SignalRecorder(
         output_dir_abs=output_abs,
         logger=g.logger,
         enabled=log_cfg.get("csv_output", True),
     )
-    g.trade_recorder = TradeRecorder(
+    g.trade_recorder = TradeRecordRecorder(
         output_dir_abs=output_abs,
         logger=g.logger,
         enabled=log_cfg.get("csv_output", True),
@@ -1751,7 +2269,9 @@ def initialize(context):
         countdown_perfect=cfg["countdown"].get("require_perfect"),
         tdst_rule=cfg["countdown"].get("tdst_cancel_rule"),
         trade_enabled=cfg["trade"].get("enabled", True),
-        trade_fraction=cfg["trade"].get("fraction_of_total_value", 0.1),
+        buy_fraction=cfg["trade"].get("buy_fraction_of_portfolio", 0.1),
+        take_profit_on_sell_countdown=cfg["trade"].get("take_profit_on_sell_countdown", False),
+        stop_loss_enabled=cfg["trade"].get("stop_loss_enabled", True),
         start_date=start_date_str,
         output_dir=output_abs,
         log_file=g.log_file_path,
@@ -1823,6 +2343,10 @@ def handle_data(context, data):
 
         last_bar_dt = bars[-1].datetime  # 昨日（或更早的已收盘 K 线）
 
+        # 回测降级：没有 tick_data / on_trade_response 时，用上一根已完成 K 线的 high/low
+        # 追踪已有仓位的止盈止损。实盘环境中该逻辑由 tick_data 负责。
+        g.trade_executor.check_backtest_exits(context, security, bars[-1])
+
         # (3) 信号层：每日全量重算
         processor = TDSignalProcessor(
             security=security, frequency=g.frequency, config=g.config, logger=g.logger,
@@ -1859,6 +2383,33 @@ def handle_data(context, data):
     # (6) 全量写入信号 CSV（按 security 分流到不同文件）
     if all_today_events:
         g.recorder.write_events(all_today_events)
+
+
+def tick_data(context, data):
+    """
+    实盘主推回调：仅在 is_trade() 为 True 时用于逐 tick 追踪止盈止损。
+    回测环境下 is_trade() 通常为 False，本函数会直接返回；回测止盈止损由
+    handle_data 中的 check_backtest_exits 降级处理。
+    """
+    try:
+        if not is_trade():  # noqa: F821 - PTrade 注入
+            return
+    except Exception:
+        return
+    g.trade_executor.check_tick_exits(context, data)
+
+
+def on_trade_response(context, trade_response):
+    """
+    实盘成交回报：买入成交后建立风控仓位；卖出成交后写 trade_record_*.csv。
+    该回调仅交易环境可用，回测环境不依赖它。
+    """
+    try:
+        if not is_trade():  # noqa: F821 - PTrade 注入
+            return
+    except Exception:
+        return
+    g.trade_executor.on_trade_response(context, trade_response)
 
 
 def after_trading_end(context, data):
