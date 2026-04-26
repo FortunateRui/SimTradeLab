@@ -62,7 +62,7 @@ _REQUIRED_CONFIG_KEYS = {
     "trade":       (
         "enabled", "buy_fraction_of_portfolio", "min_trade_value", "min_cash_for_buy",
         "take_profit_on_sell_countdown", "stop_loss_enabled", "profit_target_r_multiple",
-        "require_perfect_setup_for_buy",
+        "stop_loss_range_multiple", "require_perfect_setup_for_buy",
     ),
     "log":         ("level",),
 }
@@ -1690,7 +1690,6 @@ COUNTDOWN_STATUS_CANCEL_SAME_SETUP = "CANCEL_BY_SAME_SETUP"
 
 BUY_REJECT_TRADE_DISABLED = "TRADE_DISABLED"
 BUY_REJECT_NON_PERFECT_SETUP = "NON_PERFECT_SETUP"
-BUY_REJECT_ALREADY_OPEN_POSITION = "ALREADY_OPEN_POSITION"
 BUY_REJECT_INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
 BUY_REJECT_MIN_TRADE_VALUE = "MIN_TRADE_VALUE"
 BUY_REJECT_ORDER_REJECTED = "ORDER_REJECTED"
@@ -1723,14 +1722,16 @@ class TradeExecutor:
         self.take_profit_on_sell_countdown = bool(cfg_trade.get("take_profit_on_sell_countdown", False))
         self.stop_loss_enabled = bool(cfg_trade.get("stop_loss_enabled", True))
         self.profit_target_r_multiple = float(cfg_trade.get("profit_target_r_multiple", 1.5))
+        self.stop_loss_range_multiple = float(cfg_trade.get("stop_loss_range_multiple", 1.0))
         self.require_perfect_setup_for_buy = bool(cfg_trade.get("require_perfect_setup_for_buy", False))
         self.logger = logger
         self.trade_recorder = trade_recorder
 
-        # 每个标的当前最多跟踪一笔完整交易。后续若需要金字塔/多笔并行，可扩展为 list。
+        # 每个标的可同时跟踪多笔完整交易；每笔买入独立计算止损/止盈。
         self.open_trades = {}
         self.pending_buy_orders = {}
         self.pending_sell_orders = {}
+        self._next_trade_id = 1
 
     def execute_for_events(self, context, security, last_bar_events):
         if not last_bar_events:
@@ -1762,25 +1763,25 @@ class TradeExecutor:
         注意：刚根据该 completed_bar 信号买入的仓位，会把 last_checked_bar_dt 初始化为
         signal datetime，因此不会在同一根历史 K 上立刻被止盈/止损。
         """
-        if self._is_live_trade() or security not in self.open_trades:
+        if self._is_live_trade() or not self._open_trade_list(security):
             return
-        trade = self.open_trades[security]
         bar_dt = completed_bar.datetime
-        if trade.get("last_checked_bar_dt") and bar_dt <= trade.get("last_checked_bar_dt"):
-            return
+        for trade in list(self._open_trade_list(security)):
+            if trade.get("last_checked_bar_dt") and bar_dt <= trade.get("last_checked_bar_dt"):
+                continue
 
-        stop_loss = self._safe_float(trade.get("stop_loss_price", 0.0))
-        take_profit = self._safe_float(trade.get("take_profit_price", 0.0))
+            stop_loss = self._safe_float(trade.get("stop_loss_price", 0.0))
+            take_profit = self._safe_float(trade.get("take_profit_price", 0.0))
 
-        # 同一根 K 线同时触发时，保守按先止损处理。
-        if self.stop_loss_enabled and stop_loss > 0 and completed_bar.low <= stop_loss:
-            self._sell_open_trade(context, security, stop_loss, completed_bar.datetime, SELL_REASON_STOP_LOSS)
-            return
-        if take_profit > 0 and completed_bar.high >= take_profit:
-            self._sell_open_trade(context, security, take_profit, completed_bar.datetime, SELL_REASON_PROFIT_TARGET)
-            return
+            # 同一根 K 线同时触发时，保守按先止损处理。
+            if self.stop_loss_enabled and stop_loss > 0 and completed_bar.low <= stop_loss:
+                self._sell_open_trade(context, security, trade, stop_loss, completed_bar.datetime, SELL_REASON_STOP_LOSS)
+                continue
+            if take_profit > 0 and completed_bar.high >= take_profit:
+                self._sell_open_trade(context, security, trade, take_profit, completed_bar.datetime, SELL_REASON_PROFIT_TARGET)
+                continue
 
-        trade["last_checked_bar_dt"] = bar_dt
+            trade["last_checked_bar_dt"] = bar_dt
 
     def check_tick_exits(self, context, tick_data_obj):
         """实盘 tick_data 中追踪止盈止损。回测环境不执行。"""
@@ -1790,12 +1791,12 @@ class TradeExecutor:
             price = self._extract_tick_price(tick_data_obj, security)
             if price <= 0:
                 continue
-            trade = self.open_trades[security]
-            if self.stop_loss_enabled and price <= self._safe_float(trade.get("stop_loss_price", 0.0)):
-                self._submit_sell_order(context, security, price, SELL_REASON_STOP_LOSS)
-                continue
-            if price >= self._safe_float(trade.get("take_profit_price", 0.0)):
-                self._submit_sell_order(context, security, price, SELL_REASON_PROFIT_TARGET)
+            for trade in list(self._open_trade_list(security)):
+                if self.stop_loss_enabled and price <= self._safe_float(trade.get("stop_loss_price", 0.0)):
+                    self._submit_sell_order(context, security, trade, price, SELL_REASON_STOP_LOSS)
+                    continue
+                if price >= self._safe_float(trade.get("take_profit_price", 0.0)):
+                    self._submit_sell_order(context, security, trade, price, SELL_REASON_PROFIT_TARGET)
 
     def on_trade_response(self, context, trade_response):
         """
@@ -1828,15 +1829,12 @@ class TradeExecutor:
             security = pending["security"]
             if price <= 0:
                 price = self._safe_float(pending.get("fallback_price"))
-            self._finalize_sell(security, price, trade_dt or pending["sell_date"], pending["sell_reason"])
+            self._finalize_sell(security, pending["trade"], price, trade_dt or pending["sell_date"], pending["sell_reason"])
 
     # ----- Buy side -----
     def _try_buy_from_signal(self, context, security, ev):
         if not self.enabled:
             self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_TRADE_DISABLED)
-            return
-        if security in self.open_trades:
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_ALREADY_OPEN_POSITION)
             return
         if self.require_perfect_setup_for_buy and not self._boolish(ev.get("setup_perfect")):
             self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_NON_PERFECT_SETUP)
@@ -1887,10 +1885,11 @@ class TradeExecutor:
             self.logger.info("买入委托已提交，等待成交回报", security=security, order_id=order_id, value=round(actual_value, 2))
             return
 
-        # 回测降级：order_value 返回订单号后，读取持仓快照作为成交近似。
-        qty, pos_value, entry_price = self._get_position_detail(security)
-        if qty <= 0:
-            qty = int(actual_value / fallback_price / 100) * 100 if fallback_price > 0 else 0
+        # 回测降级：order_value 返回订单号后，按本次委托金额估算本笔成交数量。
+        # 不使用总持仓数量，避免同一标的多次买入时把历史仓位重复计入本笔记录。
+        _, _, entry_price = self._get_position_detail(security)
+        price_for_qty = entry_price if entry_price > 0 else fallback_price
+        qty = int(actual_value / price_for_qty / 100) * 100 if price_for_qty > 0 else 0
         if entry_price <= 0:
             entry_price = fallback_price
         self._open_trade_from_fill(security, ev, entry_price, qty, decision_dt)
@@ -1903,6 +1902,7 @@ class TradeExecutor:
         stop_loss, take_profit = self._calc_risk_prices(ev, buy_price)
         row = self._base_trade_record(ev, COUNTDOWN_STATUS_NORMAL)
         row.update({
+            "_trade_id": self._next_trade_id,
             "bought": True,
             "buy_reject_reason": "",
             "buy_quantity": buy_qty,
@@ -1915,40 +1915,41 @@ class TradeExecutor:
             "sell_reason": "",
             "pnl": "",
         })
-        self.open_trades[security] = row
-        self.open_trades[security]["last_checked_bar_dt"] = ev.get("datetime", "")
+        self._next_trade_id += 1
+        row["last_checked_bar_dt"] = ev.get("datetime", "")
+        self.open_trades.setdefault(security, []).append(row)
 
     def _calc_risk_prices(self, ev, buy_price):
         low = self._safe_float(ev.get("countdown_low"))
         high = self._safe_float(ev.get("countdown_low_bar_high"))
         if low <= 0 or high <= 0 or high < low:
             return "", ""
-        raw_stop_loss = low - (high - low)
+        raw_stop_loss = low - (high - low) * self.stop_loss_range_multiple
         take_profit = buy_price + (buy_price - raw_stop_loss) * self.profit_target_r_multiple
         stop_loss = raw_stop_loss if self.stop_loss_enabled else ""
         return stop_loss, take_profit
 
     # ----- Sell side / exits -----
     def _try_sell_on_sell_countdown(self, context, security, ev):
-        if not self.take_profit_on_sell_countdown or security not in self.open_trades:
+        trades = self._open_trade_list(security)
+        if not self.take_profit_on_sell_countdown or not trades:
             return
-        trade = self.open_trades[security]
         ref_price = self._safe_float(ev.get("bar_close"))
-        buy_price = self._safe_float(trade.get("buy_price"))
-        if ref_price > buy_price:
-            self._sell_open_trade(context, security, ref_price, ev.get("datetime", ""), SELL_REASON_TREND_REVERSAL)
-        else:
-            self.logger.info(
-                "Sell Countdown 出现但仓位未盈利，不做趋势反转止盈",
-                security=security, ref_price=round(ref_price, 4), buy_price=round(buy_price, 4),
-            )
+        for trade in list(trades):
+            buy_price = self._safe_float(trade.get("buy_price"))
+            if ref_price > buy_price:
+                self._sell_open_trade(context, security, trade, ref_price, ev.get("datetime", ""), SELL_REASON_TREND_REVERSAL)
+            else:
+                self.logger.info(
+                    "Sell Countdown 出现但该笔仓位未盈利，不做趋势反转止盈",
+                    security=security, trade_id=trade.get("_trade_id"),
+                    ref_price=round(ref_price, 4), buy_price=round(buy_price, 4),
+                )
 
-    def _submit_sell_order(self, context, security, fallback_price, sell_reason):
-        if security not in self.open_trades or security in self.pending_sell_orders:
+    def _submit_sell_order(self, context, security, trade, fallback_price, sell_reason):
+        if not self._trade_is_open(security, trade) or self._has_pending_sell_for_trade(trade):
             return
-        _, pos_value, _ = self._get_position_detail(security)
-        if pos_value <= 0:
-            pos_value = self._safe_float(self.open_trades[security].get("buy_price")) * self._safe_float(self.open_trades[security].get("buy_quantity"))
+        pos_value = self._trade_value(trade, fallback_price)
         try:
             order_id = order_value(security, -pos_value)  # noqa: F821 - PTrade 注入
         except Exception as e:
@@ -1959,20 +1960,19 @@ class TradeExecutor:
             return
         self.pending_sell_orders[str(order_id)] = {
             "security": security,
+            "trade": trade,
             "sell_reason": sell_reason,
             "sell_date": _format_dt(self._current_dt(context)),
             "fallback_price": fallback_price,
         }
 
-    def _sell_open_trade(self, context, security, sell_price, sell_date, sell_reason):
-        if security not in self.open_trades:
+    def _sell_open_trade(self, context, security, trade, sell_price, sell_date, sell_reason):
+        if not self._trade_is_open(security, trade):
             return
         if self._is_live_trade():
-            self._submit_sell_order(context, security, sell_price, sell_reason)
+            self._submit_sell_order(context, security, trade, sell_price, sell_reason)
             return
-        _, pos_value, _ = self._get_position_detail(security)
-        if pos_value <= 0:
-            pos_value = self._safe_float(self.open_trades[security].get("buy_price")) * self._safe_float(self.open_trades[security].get("buy_quantity"))
+        pos_value = self._trade_value(trade, sell_price)
         try:
             order_id = order_value(security, -pos_value)  # noqa: F821 - PTrade 注入
         except Exception as e:
@@ -1981,12 +1981,13 @@ class TradeExecutor:
         if not order_id:
             self.logger.info("卖出委托未提交", security=security, value=round(pos_value, 2), reason=sell_reason)
             return
-        self._finalize_sell(security, sell_price, sell_date, sell_reason)
+        self._finalize_sell(security, trade, sell_price, sell_date, sell_reason)
 
-    def _finalize_sell(self, security, sell_price, sell_date, sell_reason):
-        if security not in self.open_trades:
+    def _finalize_sell(self, security, trade, sell_price, sell_date, sell_reason):
+        if not self._trade_is_open(security, trade):
             return
-        row = dict(self.open_trades.pop(security))
+        self._remove_open_trade(security, trade)
+        row = dict(trade)
         buy_price = self._safe_float(row.get("buy_price"))
         qty = self._safe_float(row.get("buy_quantity"))
         pnl = (sell_price - buy_price) * qty
@@ -2057,6 +2058,36 @@ class TradeExecutor:
         if reason == "same_setup":
             return COUNTDOWN_STATUS_CANCEL_SAME_SETUP
         return "CANCEL_BY_{}".format(str(reason).upper() or "UNKNOWN")
+
+    def _open_trade_list(self, security):
+        return self.open_trades.get(security, [])
+
+    def _trade_is_open(self, security, trade):
+        return trade in self._open_trade_list(security)
+
+    def _remove_open_trade(self, security, trade):
+        trades = self._open_trade_list(security)
+        if trade in trades:
+            trades.remove(trade)
+        if not trades and security in self.open_trades:
+            del self.open_trades[security]
+
+    def _has_pending_sell_for_trade(self, trade):
+        trade_id = trade.get("_trade_id")
+        for pending in self.pending_sell_orders.values():
+            pending_trade = pending.get("trade")
+            if pending_trade is trade:
+                return True
+            if pending_trade is not None and pending_trade.get("_trade_id") == trade_id:
+                return True
+        return False
+
+    def _trade_value(self, trade, fallback_price):
+        qty = self._safe_float(trade.get("buy_quantity"))
+        price = self._safe_float(fallback_price)
+        if qty > 0 and price > 0:
+            return qty * price
+        return self._safe_float(trade.get("buy_price")) * qty
 
     # ----- Helpers -----
     def _portfolio_snapshot(self, context):

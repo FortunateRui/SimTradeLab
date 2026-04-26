@@ -26,7 +26,7 @@
 
     "setup": {
         "enabled": true,
-        "require_perfect_for_signal": false,
+        "require_perfect_for_signal": true,
         "extend_record_max": 18
     },
 
@@ -38,7 +38,7 @@
     "countdown": {
         "enabled": true,
         "type": "sequence",
-        "require_perfect": false,
+        "require_perfect": true,
         "tdst_cancel_rule": 4,
         "cancel_on_opposite_setup": true,
         "cancel_on_same_setup": true,
@@ -52,10 +52,11 @@
         "buy_fraction_of_portfolio": 0.1,
         "min_trade_value": 1000,
         "min_cash_for_buy": 1000,
-        "take_profit_on_sell_countdown": false,
-        "stop_loss_enabled": true,
+        "take_profit_on_sell_countdown": true,
+        "stop_loss_enabled": false,
+        "stop_loss_range_multiple": 1.0,
         "profit_target_r_multiple": 1.5,
-        "require_perfect_setup_for_buy": false
+        "require_perfect_setup_for_buy": true
     },
 
     "log": {
