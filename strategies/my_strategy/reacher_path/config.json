@@ -15,7 +15,7 @@
     "data": {
         "frequency": "1d",
         "fq": "pre",
-        "lookback_count": 365,
+        "lookback_count": 200,
         "min_required_bars": 20
     },
 
@@ -49,7 +49,7 @@
 
     "trade": {
         "enabled": true,
-        "buy_fraction_of_portfolio": 0.1,
+        "buy_fraction_of_portfolio": 0.01,
         "min_trade_value": 1000,
         "min_cash_for_buy": 1000,
         "take_profit_on_sell_countdown": true,

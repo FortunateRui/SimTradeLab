@@ -45,6 +45,18 @@ import json
 # 如需迁移目录，仅修改此常量即可；代码其它地方一律通过 CONFIG_REL_PATH 引用。
 CONFIG_REL_PATH = "TD913_xiongrui/config.json"
 
+# 本地 SimTradeLab 回测兼容路径。PTrade 实盘/云回测仍优先使用 CONFIG_REL_PATH；
+# 如果研究目录下找不到配置，再按这些路径依次尝试。
+LOCAL_CONFIG_FALLBACK_PATHS = [
+    "strategies/my_strategy/reacher_path/config.json",
+    "./strategies/my_strategy/reacher_path/config.json",
+    "config.json",
+]
+
+# load_config 会记录最终实际读取到的配置路径。initialize 创建输出目录时会用它，
+# 这样本地回测也能把 output 放到 config 同级目录下。
+LOADED_CONFIG_PATH = CONFIG_REL_PATH
+
 # 日志/CSV 中的日期时间统一格式（字符串类型）。
 DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 DATE_FMT = "%Y-%m-%d"
@@ -86,6 +98,15 @@ def _join_research_path(rel_path):
     if not base.endswith("/") and not base.endswith("\\"):
         base = base + "/"
     return base + rel_path
+
+
+def _is_local_project_path(path):
+    """
+    判断是否为本地 SimTradeLab 项目相对路径。
+    PTrade 研究目录路径仍通过 _join_research_path 处理；本地 fallback 路径则直接使用。
+    """
+    p = str(path)
+    return p.startswith("strategies/") or p.startswith("./strategies/")
 
 
 def _split_parent_rel(rel_path):
@@ -135,11 +156,25 @@ def load_config(config_rel_path):
     强制读取并校验 config.json。文件不存在或内容非法时直接抛异常，不再使用
     内置默认值兜底（避免"看似成功实则走错"）。
     """
+    global LOADED_CONFIG_PATH
     full_path = _join_research_path(config_rel_path)
+    f = None
+    read_path = full_path
+    errors = []
     try:
         f = open(full_path, "r", encoding="utf-8")
     except Exception as e:
-        raise FileNotFoundError("配置文件不存在或不可读: {} | err={}".format(full_path, e))
+        errors.append("{} | err={}".format(full_path, e))
+        # 本地 SimTradeLab 回测通常从项目根目录运行，配置文件保留在策略目录下。
+        for fallback_path in LOCAL_CONFIG_FALLBACK_PATHS:
+            try:
+                f = open(fallback_path, "r", encoding="utf-8")
+                read_path = fallback_path
+                break
+            except Exception as fallback_err:
+                errors.append("{} | err={}".format(fallback_path, fallback_err))
+        if f is None:
+            raise FileNotFoundError("配置文件不存在或不可读，已尝试: {}".format(" ; ".join(errors)))
     try:
         cfg = json.load(f)
     finally:
@@ -148,6 +183,11 @@ def load_config(config_rel_path):
     # 剥离以下划线开头的注释/预留说明字段，保持对策略透明
     cfg = _strip_underscore_keys(cfg)
     _validate_config_schema(cfg)
+    LOADED_CONFIG_PATH = read_path
+    try:
+        log.info("[CONFIG] 配置加载完成 | path={}".format(read_path))  # noqa: F821
+    except Exception:
+        pass
     return cfg
 
 
@@ -182,13 +222,17 @@ def prepare_output_dir(start_date_str, config_rel_path):
     """
     parent_rel, _ = _split_parent_rel(config_rel_path)
     base_name = start_date_str
-    parent_abs = _join_research_path(parent_rel).rstrip("/\\")
+    if _is_local_project_path(config_rel_path):
+        parent_abs = parent_rel.rstrip("/\\")
+    else:
+        parent_abs = _join_research_path(parent_rel).rstrip("/\\")
 
     # 先尝试确保父目录存在（与 config.json 同级）。如果本来就存在，
     # PTrade 的 create_dir 一般也会静默返回。
     if parent_rel:
         try:
-            create_dir(parent_rel)  # noqa: F821 - PTrade 注入
+            if not _is_local_project_path(config_rel_path):
+                create_dir(parent_rel)  # noqa: F821 - PTrade 注入
         except Exception:
             pass
 
@@ -204,7 +248,14 @@ def prepare_output_dir(start_date_str, config_rel_path):
         # 试着创建目录（若已存在且为空，PTrade 的 create_dir 一般不会抛错；
         # 若抛错则视为创建失败，尝试下一个后缀）。
         try:
-            create_dir(candidate_rel)  # noqa: F821 - PTrade 注入
+            if _is_local_project_path(config_rel_path):
+                # 本地 SimTradeLab 环境允许使用 pathlib / os，但策略文件为了兼容 PTrade
+                # 不 import os；这里用 open marker 的父目录创建能力不可用，因此退化为
+                # Python 内置 __import__ 动态导入 pathlib，只在本地路径分支执行。
+                pathlib = __import__("pathlib")
+                pathlib.Path(candidate_abs).mkdir(parents=True, exist_ok=False)
+            else:
+                create_dir(candidate_rel)  # noqa: F821 - PTrade 注入
         except Exception:
             # 创建失败一般意味着该名字已被占用但没有 .initialized —— 跳过
             continue
@@ -1218,7 +1269,12 @@ def prepare_security_output_dirs(output_dir_rel, securities):
     base_rel = output_dir_rel.rstrip("/\\")
     for security in securities:
         try:
-            create_dir(base_rel + "/" + _security_to_filename(security))  # noqa: F821
+            sec_rel = base_rel + "/" + _security_to_filename(security)
+            if _is_local_project_path(output_dir_rel):
+                pathlib = __import__("pathlib")
+                pathlib.Path(sec_rel).mkdir(parents=True, exist_ok=True)
+            else:
+                create_dir(sec_rel)  # noqa: F821
         except Exception:
             # 目录存在或 create_dir 不可用时不阻断策略，后续写文件失败会在 recorder 中记录。
             pass
@@ -2468,7 +2524,7 @@ def initialize(context):
 
     # (2) 输出目录：和 config.json 同级，按策略启动日期命名，存在则追加 _1 递增
     start_date_str = _strategy_start_date_str(context)
-    output_rel, output_abs = prepare_output_dir(start_date_str, CONFIG_REL_PATH)
+    output_rel, output_abs = prepare_output_dir(start_date_str, LOADED_CONFIG_PATH)
     g.output_dir_rel = output_rel
     g.output_dir_abs = output_abs
     g.run_tag = start_date_str
