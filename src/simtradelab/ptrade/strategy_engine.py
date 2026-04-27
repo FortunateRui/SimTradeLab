@@ -281,7 +281,8 @@ class StrategyExecutionEngine:
         # 跨日追踪：上一交易日收盘后的组合市值（用于计算真实日盈亏）
         prev_day_end_value = None
 
-        for current_date in date_range:
+        total_days = len(date_range)
+        for day_index, current_date in enumerate(date_range, 1):
             if self._cancel_event and self._cancel_event.is_set():
                 self.log.info("回测已取消")
                 return False
@@ -290,6 +291,10 @@ class StrategyExecutionEngine:
             self.context.blotter.current_dt = current_date
             global _current_backtest_date
             _current_backtest_date = str(current_date.date())
+            self.log.info(
+                f"回测进度: {day_index}/{total_days} | 当前日期: {_current_backtest_date}",
+                extra={"console_progress": True},
+            )
             prev_trade_day = self.api.get_trading_day(-1)
             if prev_trade_day:
                 self.context.previous_date = prev_trade_day
@@ -346,7 +351,8 @@ class StrategyExecutionEngine:
         # 跨日追踪：上一交易日收盘后的组合市值
         prev_day_end_value = None
 
-        for current_date in date_range:
+        total_days = len(date_range)
+        for day_index, current_date in enumerate(date_range, 1):
             if self._cancel_event and self._cancel_event.is_set():
                 self.log.info("回测已取消")
                 return False
@@ -358,6 +364,10 @@ class StrategyExecutionEngine:
             self.context.blotter.current_dt = current_date
             global _current_backtest_date
             _current_backtest_date = str(current_date.date())
+            self.log.info(
+                f"回测进度: {day_index}/{total_days} | 当前日期: {_current_backtest_date}",
+                extra={"console_progress": True},
+            )
 
             # 使用API获取真正的前一交易日
             prev_trade_day = self.api.get_trading_day(-1)

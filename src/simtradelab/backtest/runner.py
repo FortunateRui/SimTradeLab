@@ -31,6 +31,15 @@ from simtradelab.ptrade.strategy_validator import validate_strategy_file
 from simtradelab.utils.perf import timer, get_current_elapsed_time
 
 
+class _BacktestConsoleFilter(logging.Filter):
+    """终端只显示进度与严重错误，完整日志继续写入文件。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "console_progress", False):
+            return True
+        return record.levelno >= logging.ERROR
+
+
 class BacktestRunner:
     """回测执行器 - 负责编排整个回测流程"""
 
@@ -220,7 +229,9 @@ class BacktestRunner:
         """
         import sys
 
-        handlers = [logging.StreamHandler(sys.stdout)]
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.addFilter(_BacktestConsoleFilter())
+        handlers = [console_handler]
 
         # 仅在启用日志时创建文件handler
         os.makedirs(config.log_dir, exist_ok=True)
