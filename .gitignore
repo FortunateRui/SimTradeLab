@@ -77,3 +77,4 @@ data*/
 *.ipynb
 strategies/*/stats/*.csv
 .python-version
+/strategies/my_strategy/output

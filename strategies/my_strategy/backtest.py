@@ -1398,7 +1398,7 @@ class StatisticsRecorder:
       * 运行根目录写 total_statistics.csv
 
     收益率口径：
-      * 单标的策略收益 = (该标的已实现盈亏 + 浮动盈亏) / (初始资金 / 标的数)
+      * 单标的策略收益 = (该标的已实现盈亏 + 浮动盈亏) / 初始资金
       * 总策略收益 = 所有标的盈亏合计 / 初始资金
       * 单标的基准收益 = 该标的当前 close 相对本次运行首次记录 close 的收益
       * 总基准收益 = 各标的基准收益的等权平均
@@ -1421,7 +1421,8 @@ class StatisticsRecorder:
         self.output_dir_abs = output_dir_abs.rstrip("/\\")
         self.securities = list(securities)
         self.initial_capital = float(initial_capital) if initial_capital else 0.0
-        self.security_capital = self.initial_capital / len(self.securities) if self.securities else self.initial_capital
+        # 单股票统计也统一使用完整初始资金作为分母，避免多标的等权虚拟本金导致收益率被放大。
+        self.security_capital = self.initial_capital
         self._header_written_paths = set()
         self._period_count_by_security = {}
         self._benchmark_base_close_by_security = {}
