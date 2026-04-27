@@ -48,6 +48,7 @@ TARGET_FOLDER_NAME = "../output/2019-04-26"
 STOCK_OVERVIEW_IMAGE = "statistics_overview.png"
 COMBINED_WIN_RATE_IMAGE = "combined_win_rate.png"
 COMBINED_RETURN_IMAGE = "combined_profitability.png"
+TOTAL_POSITION_METRICS_IMAGE = "total_position_metrics.png"
 
 
 # CSV columns produced by backtest.py StatisticsRecorder.
@@ -259,6 +260,31 @@ def plot_combined_profitability(
 
 
 # =============================================================================
+# Chart 4: Total position metrics
+# =============================================================================
+
+def plot_total_position_metrics(target_dir: Path, total_rows: Optional[List[Dict[str, object]]]) -> None:
+    if not total_rows:
+        print("Skipped total position metrics: total_statistics.csv not found or empty.")
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    plot_line(ax, total_rows, WIN_RATE_COL, "Win Rate")
+    plot_line(ax, total_rows, STRATEGY_RETURN_COL, "Strategy Return")
+    plot_line(ax, total_rows, BENCHMARK_RETURN_COL, "Benchmark Return")
+    plot_line(ax, total_rows, STRATEGY_ANNUALIZED_COL, "Strategy Annualized Return")
+    plot_line(ax, total_rows, BENCHMARK_ANNUALIZED_COL, "Benchmark Annualized Return")
+
+    ax.set_title("Total Portfolio Metrics Over Time")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Rate")
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.legend(loc="best")
+    setup_date_axis(ax)
+    save_figure(fig, target_dir / TOTAL_POSITION_METRICS_IMAGE)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -277,8 +303,10 @@ def main() -> None:
     for stock, rows in stock_rows.items():
         plot_stock_overview(stock, rows, target_dir / stock)
 
+    total_rows = load_total_benchmark(target_dir)
     plot_combined_win_rate(stock_rows, target_dir)
-    plot_combined_profitability(stock_rows, target_dir, load_total_benchmark(target_dir))
+    plot_combined_profitability(stock_rows, target_dir, total_rows)
+    plot_total_position_metrics(target_dir, total_rows)
 
     print("Done.")
 
