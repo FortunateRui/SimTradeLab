@@ -725,6 +725,7 @@ class PtradeAPI:
 
         # 优化3+4: 批量切片+复权（减少循环开销）
         result = {}
+        result_index = {}
         # 分钟数据不支持复权
         needs_adj_pre = frequency != '1m' and fq == 'pre' and self.data_context.adj_pre_cache
         needs_adj_dypre = frequency != '1m' and fq == 'dypre' and self.data_context.adj_pre_cache
@@ -763,6 +764,7 @@ class PtradeAPI:
                 adj_b_base = adj_factors['adj_b'].values[current_idx]
 
             stock_result = {}
+            stock_index = data_source.index[start_idx:end_idx]
             for field_name in fields:
                 if field_name not in data_source.columns:
                     continue
@@ -780,6 +782,7 @@ class PtradeAPI:
 
             if stock_result:
                 result[stock] = stock_result
+                result_index[stock] = stock_index
 
         # 转换为返回格式并缓存
         if not result:
@@ -807,17 +810,25 @@ class PtradeAPI:
                     final_result = pd.DataFrame()
                 else:
                     df_data = {field_name: result[stocks_list[0]][field_name] for field_name in fields if field_name in result[stocks_list[0]]}
-                    final_result = pd.DataFrame(df_data)
+                    final_result = pd.DataFrame(df_data, index=result_index.get(stocks_list[0]))
 
             elif len(fields) == 1:
                 field_name = fields[0]
-                df_data = {stock: result[stock][field_name] for stock in stocks_list if stock in result and field_name in result[stock]}
+                df_data = {
+                    stock: pd.Series(result[stock][field_name], index=result_index.get(stock))
+                    for stock in stocks_list
+                    if stock in result and field_name in result[stock]
+                }
                 final_result = pd.DataFrame(df_data)
 
             else:
                 panel_data = {}
                 for field_name in fields:
-                    df_data = {stock: result[stock][field_name] for stock in stocks_list if stock in result and field_name in result[stock]}
+                    df_data = {
+                        stock: pd.Series(result[stock][field_name], index=result_index.get(stock))
+                        for stock in stocks_list
+                        if stock in result and field_name in result[stock]
+                    }
                     panel_data[field_name] = pd.DataFrame(df_data)
 
                 final_result = self.PanelLike(panel_data)
