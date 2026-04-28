@@ -1381,7 +1381,9 @@ class SignalRecorder:
 class TradeRecordRecorder:
     """
     记录一笔完整的"Buy Setup -> Buy Countdown -> 买入/未买入 -> 卖出/取消"生命周期。
-    文件按标的分流：600519SS/trade.csv。
+    文件同时写入：
+      * 按标的分流：600519SS/trade.csv
+      * 本次运行汇总：trade.csv
 
     只在生命周期终态写入：
       * Buy Countdown 被取消
@@ -1410,11 +1412,20 @@ class TradeRecordRecorder:
     def _csv_path_for(self, security):
         return "{}/{}/trade.csv".format(self.output_dir_abs, _security_to_filename(security))
 
+    def _total_csv_path(self):
+        return "{}/trade.csv".format(self.output_dir_abs)
+
     def record(self, row):
         if not self.enabled:
             return
         security = row.get("security", "unknown")
-        path = self._csv_path_for(security)
+        security_path = self._csv_path_for(security)
+        total_path = self._total_csv_path()
+
+        self._write_row(row, security_path, security)
+        self._write_row(row, total_path, security)
+
+    def _write_row(self, row, path, security):
         try:
             need_header = self._need_header(path)
             f = open(path, "a" if not need_header else "w", encoding="utf-8")
