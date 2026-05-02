@@ -80,3 +80,4 @@ strategies/*/stats/*.csv
 /strategies/my_strategy/output
 /strategies/my_strategy/reacher_path
 /strategies/my_strategy/stats
+/skills
