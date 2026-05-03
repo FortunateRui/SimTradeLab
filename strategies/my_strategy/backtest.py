@@ -10,7 +10,7 @@
     [3] 日志层                StrategyLogger
     [4] 数据层                Bar / MarketDataFetcher
     [5] 信号层                SetupMachine / CountdownMachine / TDSignalProcessor
-    [6] 信号与交易输出层      SignalRecorder / TradeRecordRecorder
+    [6] 元数据与交易输出层    MetadataRecorder / TradeRecordRecorder
     [7] 交易执行层            TradeExecutor
     [8] PTrade 策略钩子层     initialize / before_trading_start / handle_data / after_trading_end
 
@@ -1158,7 +1158,7 @@ class TDSignalProcessor:
                 frequency=self.frequency,
                 setup_info=setup_info,
             )
-            self.logger.info(
+            self.logger.debug(
                 "Countdown 启动", security=self.security, frequency=self.frequency, datetime_=bar.datetime,
                 direction="BUY" if new_dir == 1 else "SELL",
                 tdst_threshold=self.active_countdown._tdst_threshold,
@@ -1219,19 +1219,19 @@ class TDSignalProcessor:
                 direction=dir_str, count=ev["count"],
             )
         elif ev_type == "PLUS_TENTATIVE":
-            self.logger.info(
+            self.logger.debug(
                 "Countdown 暂记 + (满足一般条件但不满足完美)",
                 security=self.security, frequency=self.frequency, datetime_=bar.datetime, direction=dir_str,
             )
         elif ev_type == "COMPLETE":
-            self.logger.info(
+            self.logger.debug(
                 "Countdown 完成",
                 security=self.security, frequency=self.frequency, datetime_=bar.datetime,
                 direction=dir_str, perfect=ev.get("perfect", False),
                 setup_first_dt=record["setup_first_dt"],
             )
         elif ev_type == "CANCEL":
-            self.logger.info(
+            self.logger.debug(
                 "Countdown 取消",
                 security=self.security, frequency=self.frequency, datetime_=bar.datetime,
                 direction=dir_str, count=ev.get("count"), reason=ev.get("reason"),
@@ -1280,15 +1280,12 @@ def prepare_security_output_dirs(output_dir_rel, securities):
             pass
 
 
-class SignalRecorder:
+class MetadataRecorder:
     """
-    把信号事件写入每个标的目录下的 signnal.csv。
+    轻量论文元数据输出。
 
-    字段顺序（含扩展的 setup/countdown 细节，便于离线分析）：
-        datetime, security, frequency, category, type, direction, count,
-        perfect, reason,
-        setup_type, setup_perfect, setup_first_dt, setup_last_dt,
-        tdst_threshold, countdown_start_dt
+    策略端只记录事件研究和交易复盘所需的原始事件，不在策略内做周期级统计。
+    事件统一写到运行根目录 td_events.csv，避免大规模回测时生成大量中间 CSV。
     """
 
     HEADER_FIELDS = [
@@ -1301,6 +1298,14 @@ class SignalRecorder:
         "count_9_dt", "count_10_dt", "count_11_dt", "count_12_dt", "count_13_dt",
         "countdown_low_dt", "countdown_low", "countdown_low_bar_high",
         "bar_close", "bar_high", "bar_low",
+        "pre20_avg_amount", "pre20_volatility", "pre20_return",
+    ]
+    POSITION_HEADER_FIELDS = [
+        "datetime", "event", "security", "trade_id",
+        "open_trade_count", "buy_quantity", "buy_price", "entry_value",
+        "stop_loss_price", "take_profit_price",
+        "sell_price", "sell_reason", "pnl",
+        "total_value", "available_cash",
     ]
 
     def __init__(self, output_dir_abs, logger, enabled=True):
@@ -1310,56 +1315,52 @@ class SignalRecorder:
         self.enabled = bool(enabled)
         self.logger = logger
         self.output_dir_abs = output_dir_abs.rstrip("/\\")
-        # 记录每个 security 对应 CSV 文件路径的缓存；也用于避免重复写表头
         self._header_written_paths = set()
 
-    def _csv_path_for(self, security):
-        return "{}/{}/signnal.csv".format(self.output_dir_abs, _security_to_filename(security))
+    def _events_csv_path(self):
+        return "{}/td_events.csv".format(self.output_dir_abs)
+
+    def _position_csv_path(self):
+        return "{}/position_snapshot.csv".format(self.output_dir_abs)
 
     def write_events(self, events):
         if not self.enabled or not events:
             return
+        self._write_rows(self._events_csv_path(), self.HEADER_FIELDS, events, "TD 事件元数据")
 
-        # 按 security 分组；单个 CSV 只 open 一次，减少 IO
-        grouped = {}
-        for ev in events:
-            sec = ev.get("security", "unknown")
-            grouped.setdefault(sec, []).append(ev)
+    def record_position(self, row):
+        if not self.enabled:
+            return
+        self._write_rows(self._position_csv_path(), self.POSITION_HEADER_FIELDS, [row], "仓位元数据")
 
-        for security, sec_events in grouped.items():
-            self._write_group(security, sec_events)
-
-    def _write_group(self, security, sec_events):
-        path = self._csv_path_for(security)
+    def _write_rows(self, path, header_fields, rows, label):
         try:
-            need_header = self._need_header(path)
+            need_header = self._need_header(path, header_fields)
             f = open(path, "a" if not need_header else "w", encoding="utf-8")
             try:
                 if need_header:
-                    f.write(",".join(self.HEADER_FIELDS) + "\n")
-                for ev in sec_events:
-                    row = [self._csv_escape(ev.get(k, "")) for k in self.HEADER_FIELDS]
-                    f.write(",".join(row) + "\n")
+                    f.write(",".join(header_fields) + "\n")
+                for row in rows:
+                    values = [self._csv_escape(row.get(k, "")) for k in header_fields]
+                    f.write(",".join(values) + "\n")
             finally:
                 f.close()
             self._header_written_paths.add(path)
-            self.logger.debug(
-                "信号已写入 CSV",
-                security=security, count=len(sec_events), path=path,
-            )
+            self.logger.debug("{}已写入".format(label), count=len(rows), path=path)
         except Exception as e:
-            self.logger.error("写入信号 CSV 失败", security=security, path=path, err=e)
+            self.logger.error("写入{}失败".format(label), path=path, err=e)
 
-    def _need_header(self, path):
+    def _need_header(self, path, header_fields=None):
         if path in self._header_written_paths:
             return False
+        fields = header_fields or self.HEADER_FIELDS
         try:
             f = open(path, "r", encoding="utf-8")
             try:
                 first = f.readline()
             finally:
                 f.close()
-            if first.startswith(",".join(self.HEADER_FIELDS[:3])):
+            if first.startswith(",".join(fields[:3])):
                 self._header_written_paths.add(path)
                 return False
             return True
@@ -1392,14 +1393,14 @@ class TradeRecordRecorder:
     """
 
     HEADER_FIELDS = [
-        "security",
+        "datetime", "security",
         "setup_completed_at", "setup_is_perfect", "setup_highest_high",
         "count_1_at", "count_2_at", "count_3_at", "count_4_at", "count_5_at",
         "count_6_at", "count_7_at", "count_8_at", "count_8_close",
         "count_9_at", "count_10_at", "count_11_at", "count_12_at", "count_13_at",
         "countdown_completed_count", "countdown_is_perfect", "countdown_status",
         "bought", "buy_reject_reason", "buy_quantity", "buy_price", "buy_date",
-        "stop_loss_price", "take_profit_price",
+        "entry_value", "stop_loss_price", "take_profit_price",
         "sell_price", "sell_date", "sell_reason", "pnl",
     ]
 
@@ -1432,7 +1433,7 @@ class TradeRecordRecorder:
             try:
                 if need_header:
                     f.write(",".join(self.HEADER_FIELDS) + "\n")
-                values = [SignalRecorder._csv_escape(row.get(k, "")) for k in self.HEADER_FIELDS]
+                values = [MetadataRecorder._csv_escape(row.get(k, "")) for k in self.HEADER_FIELDS]
                 f.write(",".join(values) + "\n")
             finally:
                 f.close()
@@ -1456,203 +1457,6 @@ class TradeRecordRecorder:
             return True
         except Exception:
             return True
-
-
-class StatisticsRecorder:
-    """
-    周期级统计输出：
-      * 每个标的目录写 statistics.csv
-      * 运行根目录写 total_statistics.csv
-
-    收益率口径：
-      * 单标的策略收益 = (该标的已实现盈亏 + 浮动盈亏) / 初始资金
-      * 总策略收益 = 所有标的盈亏合计 / 初始资金
-      * 单标的基准收益 = 该标的当前 close 相对本次运行首次记录 close 的收益
-      * 总基准收益 = 各标的基准收益的等权平均
-    """
-
-    SECURITY_HEADER_FIELDS = [
-        "datetime", "security", "closed_trade_count", "winning_trade_count", "win_rate",
-        "realized_pnl", "floating_pnl", "max_drawdown", "strategy_return", "benchmark_return",
-        "strategy_annualized_return", "benchmark_annualized_return",
-    ]
-    TOTAL_HEADER_FIELDS = [
-        "datetime", "closed_trade_count", "winning_trade_count", "win_rate",
-        "realized_pnl", "floating_pnl", "max_drawdown", "strategy_return", "benchmark_return",
-        "strategy_annualized_return", "benchmark_annualized_return",
-    ]
-
-    def __init__(self, output_dir_abs, logger, securities, initial_capital, enabled=True):
-        self.enabled = bool(enabled)
-        self.logger = logger
-        self.output_dir_abs = output_dir_abs.rstrip("/\\")
-        self.securities = list(securities)
-        self.initial_capital = float(initial_capital) if initial_capital else 0.0
-        # 单股票统计也统一使用完整初始资金作为分母，避免多标的等权虚拟本金导致收益率被放大。
-        self.security_capital = self.initial_capital
-        self._header_written_paths = set()
-        self._period_count_by_security = {}
-        self._benchmark_base_close_by_security = {}
-        self._peak_nav_by_security = {}
-        self._max_drawdown_by_security = {}
-        self._total_period_count = 0
-        self._total_peak_nav = 1.0
-        self._total_max_drawdown = 0.0
-
-    def write_cycle(self, dt_text, security_metrics, close_by_security):
-        if not self.enabled:
-            return
-        total_realized = 0.0
-        total_floating = 0.0
-        total_closed = 0
-        total_wins = 0
-        benchmark_returns = []
-
-        for security in self.securities:
-            metrics = security_metrics.get(security, {})
-            close_price = self._safe_float(close_by_security.get(security))
-            row = self._make_security_row(dt_text, security, metrics, close_price)
-            self._write_row(self._security_csv_path(security), self.SECURITY_HEADER_FIELDS, row)
-
-            total_realized += self._safe_float(metrics.get("realized_pnl"))
-            total_floating += self._safe_float(metrics.get("floating_pnl"))
-            total_closed += int(metrics.get("closed_trade_count", 0) or 0)
-            total_wins += int(metrics.get("winning_trade_count", 0) or 0)
-            if row.get("benchmark_return") != "":
-                benchmark_returns.append(self._safe_float(row.get("benchmark_return")))
-
-        total_row = self._make_total_row(
-            dt_text, total_closed, total_wins, total_realized, total_floating, benchmark_returns
-        )
-        self._write_row(self._total_csv_path(), self.TOTAL_HEADER_FIELDS, total_row)
-
-    def _make_security_row(self, dt_text, security, metrics, close_price):
-        self._period_count_by_security[security] = self._period_count_by_security.get(security, 0) + 1
-        periods = self._period_count_by_security[security]
-
-        if security not in self._benchmark_base_close_by_security and close_price > 0:
-            self._benchmark_base_close_by_security[security] = close_price
-        base_close = self._safe_float(self._benchmark_base_close_by_security.get(security))
-
-        realized = self._safe_float(metrics.get("realized_pnl"))
-        floating = self._safe_float(metrics.get("floating_pnl"))
-        closed_count = int(metrics.get("closed_trade_count", 0) or 0)
-        win_count = int(metrics.get("winning_trade_count", 0) or 0)
-        win_rate = (float(win_count) / closed_count) if closed_count > 0 else 0.0
-
-        pnl = realized + floating
-        nav = 1.0 + (pnl / self.security_capital if self.security_capital > 0 else 0.0)
-        max_dd = self._update_drawdown(security, nav)
-        strategy_return = nav - 1.0
-        benchmark_return = (close_price / base_close - 1.0) if base_close > 0 and close_price > 0 else ""
-
-        return {
-            "datetime": dt_text,
-            "security": security,
-            "closed_trade_count": closed_count,
-            "winning_trade_count": win_count,
-            "win_rate": round(win_rate, 6),
-            "realized_pnl": round(realized, 2),
-            "floating_pnl": round(floating, 2),
-            "max_drawdown": round(max_dd, 6),
-            "strategy_return": round(strategy_return, 6),
-            "benchmark_return": round(benchmark_return, 6) if benchmark_return != "" else "",
-            "strategy_annualized_return": round(self._annualize(strategy_return, periods), 6),
-            "benchmark_annualized_return": round(self._annualize(benchmark_return, periods), 6) if benchmark_return != "" else "",
-        }
-
-    def _make_total_row(self, dt_text, closed_count, win_count, realized, floating, benchmark_returns):
-        self._total_period_count += 1
-        win_rate = (float(win_count) / closed_count) if closed_count > 0 else 0.0
-        pnl = realized + floating
-        nav = 1.0 + (pnl / self.initial_capital if self.initial_capital > 0 else 0.0)
-        if nav > self._total_peak_nav:
-            self._total_peak_nav = nav
-        dd = (self._total_peak_nav - nav) / self._total_peak_nav if self._total_peak_nav > 0 else 0.0
-        if dd > self._total_max_drawdown:
-            self._total_max_drawdown = dd
-        strategy_return = nav - 1.0
-        benchmark_return = sum(benchmark_returns) / len(benchmark_returns) if benchmark_returns else ""
-        return {
-            "datetime": dt_text,
-            "closed_trade_count": closed_count,
-            "winning_trade_count": win_count,
-            "win_rate": round(win_rate, 6),
-            "realized_pnl": round(realized, 2),
-            "floating_pnl": round(floating, 2),
-            "max_drawdown": round(self._total_max_drawdown, 6),
-            "strategy_return": round(strategy_return, 6),
-            "benchmark_return": round(benchmark_return, 6) if benchmark_return != "" else "",
-            "strategy_annualized_return": round(self._annualize(strategy_return, self._total_period_count), 6),
-            "benchmark_annualized_return": round(self._annualize(benchmark_return, self._total_period_count), 6) if benchmark_return != "" else "",
-        }
-
-    def _update_drawdown(self, security, nav):
-        peak = self._peak_nav_by_security.get(security, 1.0)
-        if nav > peak:
-            peak = nav
-            self._peak_nav_by_security[security] = peak
-        dd = (peak - nav) / peak if peak > 0 else 0.0
-        max_dd = self._max_drawdown_by_security.get(security, 0.0)
-        if dd > max_dd:
-            max_dd = dd
-            self._max_drawdown_by_security[security] = max_dd
-        return max_dd
-
-    def _annualize(self, return_value, periods):
-        try:
-            r = float(return_value)
-        except Exception:
-            return ""
-        if periods <= 0:
-            return 0.0
-        base = 1.0 + r
-        if base <= 0:
-            return -1.0
-        return base ** (252.0 / periods) - 1.0
-
-    def _security_csv_path(self, security):
-        return "{}/{}/statistics.csv".format(self.output_dir_abs, _security_to_filename(security))
-
-    def _total_csv_path(self):
-        return "{}/total_statistics.csv".format(self.output_dir_abs)
-
-    def _write_row(self, path, header_fields, row):
-        try:
-            need_header = self._need_header(path, header_fields)
-            f = open(path, "a" if not need_header else "w", encoding="utf-8")
-            try:
-                if need_header:
-                    f.write(",".join(header_fields) + "\n")
-                f.write(",".join(SignalRecorder._csv_escape(row.get(k, "")) for k in header_fields) + "\n")
-            finally:
-                f.close()
-            self._header_written_paths.add(path)
-        except Exception as e:
-            self.logger.error("写入统计 CSV 失败", path=path, err=e)
-
-    def _need_header(self, path, header_fields):
-        if path in self._header_written_paths:
-            return False
-        try:
-            f = open(path, "r", encoding="utf-8")
-            try:
-                first = f.readline()
-            finally:
-                f.close()
-            if first.startswith(",".join(header_fields[:2])):
-                self._header_written_paths.add(path)
-                return False
-            return True
-        except Exception:
-            return True
-
-    @staticmethod
-    def _safe_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return 0.0
 
 
 def _format_dt(dt, fmt=DATETIME_FMT):
@@ -1690,13 +1494,14 @@ class TradeExecutor:
         * 满仓（可用现金 < min_cash_for_buy）→ 禁止买入
     """
 
-    def __init__(self, cfg_trade, logger, trade_recorder=None):
+    def __init__(self, cfg_trade, logger, trade_recorder=None, metadata_recorder=None):
         self.enabled = bool(cfg_trade.get("enabled", True))
         self.fraction = float(cfg_trade.get("buy_fraction_of_portfolio", 0.1))
         self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
         self.min_cash_for_buy = float(cfg_trade.get("min_cash_for_buy", 1000))
         self.logger = logger
         self.trade_recorder = trade_recorder
+        self.metadata_recorder = metadata_recorder
 
     # ----- 对外入口 -----
     def execute_for_events(self, context, security, last_bar_events):
@@ -1729,6 +1534,7 @@ class TradeExecutor:
             return
 
         snap = self._portfolio_snapshot(context)
+        self._last_portfolio_snapshot = snap
         total_value = snap["total_value"]
         available_cash = snap["available_cash"]
         target_trade_value = total_value * self.fraction
@@ -1993,7 +1799,7 @@ class TradeExecutor:
         并在后续 handle_data 的上一根已完成 K 线上用 high/low 判断止盈止损。
     """
 
-    def __init__(self, cfg_trade, logger, trade_recorder=None):
+    def __init__(self, cfg_trade, logger, trade_recorder=None, metadata_recorder=None):
         self.enabled = bool(cfg_trade.get("enabled", True))
         self.buy_fraction = float(cfg_trade.get("buy_fraction_of_portfolio", 0.1))
         self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
@@ -2005,6 +1811,7 @@ class TradeExecutor:
         self.require_perfect_setup_for_buy = bool(cfg_trade.get("require_perfect_setup_for_buy", False))
         self.logger = logger
         self.trade_recorder = trade_recorder
+        self.metadata_recorder = metadata_recorder
 
         # 每个标的可同时跟踪多笔完整交易；每笔买入独立计算止损/止盈。
         self.open_trades = {}
@@ -2012,6 +1819,7 @@ class TradeExecutor:
         self.pending_buy_orders = {}
         self.pending_sell_orders = {}
         self._next_trade_id = 1
+        self._last_portfolio_snapshot = None
 
     def execute_for_events(self, context, security, last_bar_events):
         if not last_bar_events:
@@ -2109,6 +1917,7 @@ class TradeExecutor:
             security = pending["security"]
             if price <= 0:
                 price = self._safe_float(pending.get("fallback_price"))
+            self._last_portfolio_snapshot = self._portfolio_snapshot(context)
             self._finalize_sell(security, pending["trade"], price, trade_dt or pending["sell_date"], pending["sell_reason"])
 
     # ----- Buy side -----
@@ -2181,6 +1990,7 @@ class TradeExecutor:
     def _open_trade_from_fill(self, security, ev, buy_price, buy_qty, buy_date):
         stop_loss, take_profit = self._calc_risk_prices(ev, buy_price)
         row = self._base_trade_record(ev, COUNTDOWN_STATUS_NORMAL)
+        entry_value = buy_price * buy_qty if buy_price and buy_qty else 0.0
         row.update({
             "_trade_id": self._next_trade_id,
             "bought": True,
@@ -2188,6 +1998,7 @@ class TradeExecutor:
             "buy_quantity": buy_qty,
             "buy_price": round(buy_price, 4),
             "buy_date": buy_date,
+            "entry_value": round(entry_value, 2),
             "stop_loss_price": round(stop_loss, 4) if stop_loss else "",
             "take_profit_price": round(take_profit, 4) if take_profit else "",
             "sell_price": "",
@@ -2198,6 +2009,7 @@ class TradeExecutor:
         self._next_trade_id += 1
         row["last_checked_bar_dt"] = ev.get("datetime", "")
         self.open_trades.setdefault(security, []).append(row)
+        self._record_position_snapshot("OPEN", security, row, buy_date, sell_price="", sell_reason="", pnl="")
 
     def _calc_risk_prices(self, ev, buy_price):
         low = self._safe_float(ev.get("countdown_low"))
@@ -2261,6 +2073,7 @@ class TradeExecutor:
         if not order_id:
             self.logger.info("卖出委托未提交", security=security, value=round(pos_value, 2), reason=sell_reason)
             return
+        self._last_portfolio_snapshot = self._portfolio_snapshot(context)
         self._finalize_sell(security, trade, sell_price, sell_date, sell_reason)
 
     def _finalize_sell(self, security, trade, sell_price, sell_date, sell_reason):
@@ -2272,6 +2085,7 @@ class TradeExecutor:
         qty = self._safe_float(row.get("buy_quantity"))
         pnl = (sell_price - buy_price) * qty
         row.update({
+            "datetime": sell_date,
             "sell_price": round(sell_price, 4),
             "sell_date": sell_date,
             "sell_reason": sell_reason,
@@ -2279,6 +2093,7 @@ class TradeExecutor:
         })
         self.closed_trade_pnls.setdefault(security, []).append(pnl)
         self.trade_recorder.record(row)
+        self._record_position_snapshot("CLOSE", security, row, sell_date, sell_price=sell_price, sell_reason=sell_reason, pnl=pnl)
         self.logger.info("交易生命周期结束", security=security, sell_reason=sell_reason, pnl=round(pnl, 2))
 
     # ----- Records -----
@@ -2288,11 +2103,13 @@ class TradeExecutor:
         status = countdown_status or self._countdown_status(ev)
         row = self._base_trade_record(ev, status)
         row.update({
+            "datetime": ev.get("datetime", ""),
             "bought": bool(bought),
             "buy_reject_reason": buy_reject_reason,
             "buy_quantity": "",
             "buy_price": "",
             "buy_date": "",
+            "entry_value": "",
             "stop_loss_price": "",
             "take_profit_price": "",
             "sell_price": "",
@@ -2304,6 +2121,7 @@ class TradeExecutor:
 
     def _base_trade_record(self, ev, countdown_status):
         return {
+            "datetime": ev.get("datetime", ""),
             "security": ev.get("security", ""),
             "setup_completed_at": ev.get("setup_last_dt", ""),
             "setup_is_perfect": ev.get("setup_perfect", ""),
@@ -2326,6 +2144,32 @@ class TradeExecutor:
             "countdown_is_perfect": ev.get("perfect", ""),
             "countdown_status": countdown_status,
         }
+
+    def _record_position_snapshot(self, event, security, trade, dt_text, sell_price="", sell_reason="", pnl=""):
+        if self.metadata_recorder is None:
+            return
+        snap = {
+            "datetime": dt_text,
+            "event": event,
+            "security": security,
+            "trade_id": trade.get("_trade_id", ""),
+            "open_trade_count": len(self._open_trade_list(security)),
+            "buy_quantity": trade.get("buy_quantity", ""),
+            "buy_price": trade.get("buy_price", ""),
+            "entry_value": trade.get("entry_value", ""),
+            "stop_loss_price": trade.get("stop_loss_price", ""),
+            "take_profit_price": trade.get("take_profit_price", ""),
+            "sell_price": round(sell_price, 4) if sell_price != "" else "",
+            "sell_reason": sell_reason,
+            "pnl": round(pnl, 2) if pnl != "" else "",
+        }
+        latest = self._last_portfolio_snapshot or {}
+        port = {
+            "total_value": latest.get("total_value", ""),
+            "available_cash": latest.get("available_cash", ""),
+        }
+        snap.update(port)
+        self.metadata_recorder.record_position(snap)
 
     def _countdown_status(self, ev):
         ev_type = ev.get("type", "")
@@ -2523,6 +2367,47 @@ def _strategy_start_date_str(context):
     return _format_dt(dt, DATE_FMT) if dt is not None else "unknown_start_date"
 
 
+def _enrich_events_with_bar_context(events, bars):
+    """
+    为论文离线分析补充事件日前 20 日的轻量上下文字段。
+    这些字段只做原始元数据记录，分层统计和图表生成放到离线工具中完成。
+    """
+    if not events or not bars:
+        return
+    window = bars[-20:] if len(bars) >= 20 else list(bars)
+    amounts = []
+    closes = []
+    for b in window:
+        try:
+            if b.amount is not None:
+                amounts.append(float(b.amount))
+        except Exception:
+            pass
+        try:
+            closes.append(float(b.close))
+        except Exception:
+            pass
+
+    avg_amount = sum(amounts) / len(amounts) if amounts else ""
+    pre20_return = ""
+    volatility = ""
+    if len(closes) >= 2 and closes[0] > 0:
+        pre20_return = closes[-1] / closes[0] - 1.0
+        returns = []
+        for i in range(1, len(closes)):
+            if closes[i - 1] > 0:
+                returns.append(closes[i] / closes[i - 1] - 1.0)
+        if returns:
+            mean_ret = sum(returns) / len(returns)
+            variance = sum((r - mean_ret) * (r - mean_ret) for r in returns) / len(returns)
+            volatility = variance ** 0.5
+
+    for ev in events:
+        ev["pre20_avg_amount"] = round(avg_amount, 4) if avg_amount != "" else ""
+        ev["pre20_return"] = round(pre20_return, 6) if pre20_return != "" else ""
+        ev["pre20_volatility"] = round(volatility, 6) if volatility != "" else ""
+
+
 def initialize(context):
     """
     PTrade 在策略启动时调用一次。此函数中不可调用 get_history / get_price /
@@ -2571,8 +2456,8 @@ def initialize(context):
         frequency=g.frequency, fq=g.fq, lookback_count=g.lookback_count, logger=g.logger,
     )
 
-    # (6) 信号输出层 & 交易生命周期输出层（<SEC>/signnal.csv + <SEC>/trade.csv）
-    g.recorder = SignalRecorder(
+    # (6) 论文元数据输出层 & 交易生命周期输出层（td_events.csv + trade.csv）
+    g.recorder = MetadataRecorder(
         output_dir_abs=output_abs,
         logger=g.logger,
         enabled=log_cfg.get("csv_output", True),
@@ -2582,26 +2467,14 @@ def initialize(context):
         logger=g.logger,
         enabled=log_cfg.get("csv_output", True),
     )
-    stats_cfg = cfg["statistics"]
-    try:
-        initial_capital = float(getattr(getattr(context, "portfolio", None), "starting_cash", 0.0))
-    except Exception:
-        initial_capital = 0.0
-    if initial_capital <= 0:
-        initial_capital = float(getattr(context, "capital_base", 0.0) or 0.0)
-    g.statistics_recorder = StatisticsRecorder(
-        output_dir_abs=output_abs,
-        logger=g.logger,
-        securities=g.securities,
-        initial_capital=initial_capital,
-        enabled=stats_cfg.get("enabled", False),
-    )
+    g.statistics_recorder = None
 
     # (7) 交易执行层
     g.trade_executor = TradeExecutor(
         cfg_trade=cfg["trade"],
         logger=g.logger,
         trade_recorder=g.trade_recorder,
+        metadata_recorder=g.recorder,
     )
 
     # (8) 当日有效（非停牌）标的列表，由 before_trading_start 每日刷新
@@ -2618,7 +2491,7 @@ def initialize(context):
         buy_fraction=cfg["trade"].get("buy_fraction_of_portfolio", 0.1),
         take_profit_on_sell_countdown=cfg["trade"].get("take_profit_on_sell_countdown", False),
         stop_loss_enabled=cfg["trade"].get("stop_loss_enabled", True),
-        statistics_enabled=cfg["statistics"].get("enabled", False),
+        metadata_output=log_cfg.get("csv_output", True),
         start_date=start_date_str,
         output_dir=output_abs,
         log_file=g.log_file_path,
@@ -2660,15 +2533,11 @@ def handle_data(context, data):
         1. 数据层拉取近 N 根有效 K 线（include=False → 最后一根 = 昨日已收盘 K 线）
         2. 构造全新 TDSignalProcessor，从头跑完整 TD 流水线
         3. 筛出"最后一根 K 线（= 昨日）"产生的信号事件——这些是今天可以执行的信号
-        4. 交易层基于这些信号在今日下单；所有事件写入 per-security 信号 CSV
+        4. 交易层基于这些信号在今日下单；事件写入根目录 td_events.csv
     """
     all_today_events = []
-    security_metrics = {}
-    close_by_security = {}
-    try:
-        cycle_dt_text = _format_dt(context.blotter.current_dt)
-    except Exception:
-        cycle_dt_text = _format_dt(getattr(context, "current_dt", None))
+    skipped_halt = 0
+    skipped_data = 0
 
     for security in g.active_securities_today:
         # (1) 二次确认当日是否停牌，避免对今日无法交易的标的下单
@@ -2679,28 +2548,20 @@ def handle_data(context, data):
             query_date = None
 
         if MarketDataFetcher.is_halt_today(security, query_date):
-            g.logger.info(
-                "标的当日停牌，跳过", security=security, frequency=g.frequency, datetime_=query_date,
-            )
+            skipped_halt += 1
             continue
 
         # (2) 数据层
         bars = g.data_fetcher.fetch_recent_bars(security)
         if len(bars) < g.min_required_bars:
-            g.logger.warning(
-                "有效 K 线数量不足，跳过本周期",
-                security=security, frequency=g.frequency, valid=len(bars),
-                min_required=g.min_required_bars,
-            )
+            skipped_data += 1
             continue
 
         last_bar_dt = bars[-1].datetime  # 昨日（或更早的已收盘 K 线）
-        close_by_security[security] = bars[-1].close
 
         # 回测降级：没有 tick_data / on_trade_response 时，用上一根已完成 K 线的 high/low
         # 追踪已有仓位的止盈止损。实盘环境中该逻辑由 tick_data 负责。
         g.trade_executor.check_backtest_exits(context, security, bars[-1])
-        security_metrics[security] = g.trade_executor.get_statistics_metrics(security, bars[-1].close)
 
         # (3) 信号层：每日全量重算
         processor = TDSignalProcessor(
@@ -2711,22 +2572,8 @@ def handle_data(context, data):
         # (4) 仅关注"最后一根 K 线"产生的事件——这些是"今日可执行"的新鲜信号
         last_bar_events = [ev for ev in all_events if ev["datetime"] == last_bar_dt]
 
-        g.logger.debug(
-            "本周期事件统计",
-            security=security, frequency=g.frequency, signal_bar_dt=last_bar_dt,
-            historical_events=len(all_events) - len(last_bar_events),
-            last_bar_events=len(last_bar_events),
-        )
-
         if last_bar_events:
-            for ev in last_bar_events:
-                g.logger.info(
-                    "LAST-BAR SIGNAL",
-                    security=ev["security"], frequency=ev["frequency"],
-                    signal_bar_dt=ev["datetime"],
-                    type=ev["type"], direction=ev["direction"], count=ev.get("count"),
-                    perfect=ev.get("perfect", ""),
-                )
+            _enrich_events_with_bar_context(last_bar_events, bars)
             # (5) 交易层：按"昨日信号 → 今日下单"的时序执行
             g.trade_executor.execute_for_events(
                 context=context,
@@ -2735,13 +2582,12 @@ def handle_data(context, data):
             )
             all_today_events.extend(last_bar_events)
 
-    # (6) 全量写入信号 CSV（按 security 分流到不同文件）
+    # (6) 写入根目录 TD 事件元数据
     if all_today_events:
         g.recorder.write_events(all_today_events)
-
-    # (7) 周期统计输出。若某只股票当日停牌/数据不足，则沿用空 close，不输出该股票本周期统计。
-    if getattr(g, "statistics_recorder", None) is not None:
-        g.statistics_recorder.write_cycle(cycle_dt_text, security_metrics, close_by_security)
+        g.logger.info("本周期 TD 事件", count=len(all_today_events))
+    if skipped_halt or skipped_data:
+        g.logger.debug("本周期跳过标的", halt=skipped_halt, insufficient_data=skipped_data)
 
 
 def tick_data(context, data):
