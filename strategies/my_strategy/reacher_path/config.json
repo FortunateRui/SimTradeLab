@@ -5034,9 +5034,7 @@
     },
 
     "setup": {
-        "enabled": true,
-        "require_perfect_for_signal": false,
-        "extend_record_max": 18
+        "require_perfect_for_signal": false
     },
 
     "intersection": {
@@ -5066,10 +5064,6 @@
         "stop_loss_range_multiple": 1.0,
         "profit_target_r_multiple": 1.5,
         "require_perfect_setup_for_buy": false
-    },
-
-    "statistics": {
-        "enabled": true
     },
 
     "log": {

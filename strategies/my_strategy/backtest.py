@@ -64,7 +64,7 @@ EVENT_OUTCOME_WINDOWS = (5, 20, 60, 120)
 
 # 配置 schema 中要求必填的顶层段。缺失即视为非法配置。
 _REQUIRED_CONFIG_SECTIONS = (
-    "universe", "data", "backtest", "setup", "countdown", "trade", "statistics", "log",
+    "universe", "data", "backtest", "setup", "countdown", "trade", "log",
 )
 _REQUIRED_CONFIG_KEYS = {
     "universe":    ("securities", "benchmark"),
@@ -77,7 +77,6 @@ _REQUIRED_CONFIG_KEYS = {
         "take_profit_on_sell_countdown", "stop_loss_enabled", "profit_target_r_multiple",
         "stop_loss_range_multiple", "require_perfect_setup_for_buy",
     ),
-    "statistics":  ("enabled",),
     "log":         ("level",),
 }
 
@@ -1485,303 +1484,6 @@ def _format_dt(dt, fmt=DATETIME_FMT):
 # [7] 交易执行层
 # =============================================================================
 
-class TradeExecutor:
-    """
-    基于"上一根已收盘 K 线"产生的信号，在"今天盘中"下单。
-
-    时序（修复 available_cash=0 的根因）:
-        1. 数据层 include=False，导致 handle_data 拿到的最后一根 K 线 = 昨日（上一 bar）
-        2. 信号层基于昨日 K 线计算 TD，发出的完成信号其 event.datetime = 昨日
-        3. 交易层读取 context.portfolio 的当前总资产与可用现金（此时为今日盘中状态）
-        4. order_value 以当日市价下单
-
-    关于"available_cash=0.0"的排查:
-        * 旧实现通过 `getattr(..., "available_cash", 0.0)` 读取，任何异常 / 缺失属性
-          都会直接落到 0.0。现在改为：显式尝试 `portfolio.available_cash` →
-          `portfolio.cash` → `portfolio._cash` → `portfolio.starting_cash` →
-          `context.capital_base` 多重回退，并在读取到 0.0 时将快照完整写入日志，
-          便于定位到底是哪一层返回了 0。
-        * 另外，`total_value` 也做类似健壮处理。
-
-    必要检查:
-        * 空仓（仓位数量 ≤ 0 且仓位市值 ≤ 0）→ 禁止卖出
-        * 满仓（可用现金 < min_cash_for_buy）→ 禁止买入
-    """
-
-    def __init__(self, cfg_trade, logger, trade_recorder=None, metadata_recorder=None):
-        self.enabled = bool(cfg_trade.get("enabled", True))
-        self.fraction = float(cfg_trade.get("buy_fraction_of_portfolio", 0.1))
-        self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
-        self.min_cash_for_buy = float(cfg_trade.get("min_cash_for_buy", 1000))
-        self.logger = logger
-        self.trade_recorder = trade_recorder
-        self.metadata_recorder = metadata_recorder
-
-    # ----- 对外入口 -----
-    def execute_for_events(self, context, security, last_bar_events):
-        """
-        last_bar_events: 上一根已收盘 K 线产生的事件（= 今日可用于下单的信号）。
-        仅处理 *_COUNTDOWN_COMPLETE 事件。
-        """
-        if not self.enabled or not last_bar_events:
-            return
-
-        completion_events = []
-        for ev in last_bar_events:
-            if ev.get("category") != "COUNTDOWN":
-                continue
-            ev_type = ev.get("type", "")
-            if ev_type.startswith("BUY_COUNTDOWN_COMPLETE") or ev_type.startswith("SELL_COUNTDOWN_COMPLETE"):
-                completion_events.append(ev)
-
-        if not completion_events:
-            return
-
-        for ev in completion_events:
-            self._execute_single_event(context, security, ev)
-
-    # ----- 单事件处理 -----
-    def _execute_single_event(self, context, security, ev):
-        direction = int(ev.get("direction", 0))
-        if direction not in (1, -1):
-            self.logger.warning("交易方向非法，跳过", security=security, direction=direction, event_type=ev.get("type"))
-            return
-
-        snap = self._portfolio_snapshot(context)
-        self._last_portfolio_snapshot = snap
-        total_value = snap["total_value"]
-        available_cash = snap["available_cash"]
-        target_trade_value = total_value * self.fraction
-
-        pos_qty, pos_value = self._get_position_snapshot(security)
-        decision_dt = _format_dt(self._current_dt(context))
-        base_row = self._make_base_row(decision_dt, security, direction, ev, snap, pos_qty, pos_value, target_trade_value)
-
-        # 目标金额过小（总资产本身就极低或 fraction 设置过小）
-        if target_trade_value < self.min_trade_value:
-            self.logger.info(
-                "交易金额过小，跳过",
-                security=security, event_type=ev.get("type"),
-                trade_value=round(target_trade_value, 2), min_trade_value=self.min_trade_value,
-                total_value=round(total_value, 2),
-            )
-            self._record(base_row, status="SKIP_MIN_VALUE", actual_value=0.0)
-            return
-
-        # 买入前风控：可用现金是否足够
-        if direction == 1 and available_cash < self.min_cash_for_buy:
-            self.logger.info(
-                "满仓或现金不足，禁止买入",
-                security=security, event_type=ev.get("type"),
-                available_cash=round(available_cash, 2), min_cash_for_buy=self.min_cash_for_buy,
-                total_value=round(total_value, 2),
-                # 全快照：方便定位是哪一层拿到的 0
-                snapshot=snap["debug"],
-            )
-            self._record(base_row, status="SKIP_FULL_POSITION", actual_value=0.0)
-            return
-
-        # 卖出前风控：空仓
-        if direction == -1 and pos_qty <= 0 and pos_value <= 0:
-            self.logger.info(
-                "空仓状态，禁止卖出",
-                security=security, event_type=ev.get("type"),
-                position_qty=pos_qty, position_value=round(pos_value, 2),
-            )
-            self._record(base_row, status="SKIP_EMPTY_POSITION", actual_value=0.0)
-            return
-
-        # 计算实际下单金额并下单
-        if direction == 1:
-            actual_value = min(target_trade_value, available_cash)
-            if actual_value < self.min_trade_value:
-                self.logger.info(
-                    "可买金额不足最小门槛，跳过",
-                    security=security, event_type=ev.get("type"),
-                    actual_value=round(actual_value, 2), min_trade_value=self.min_trade_value,
-                )
-                self._record(base_row, status="SKIP_MIN_CASH", actual_value=round(actual_value, 2))
-                return
-            try:
-                order_value(security, actual_value)  # noqa: F821 - PTrade 注入
-            except Exception as e:
-                self.logger.error("order_value 调用失败", security=security, err=e, value=actual_value)
-                self._record(base_row, status="ORDER_ERROR", actual_value=round(actual_value, 2))
-                return
-            self.logger.info(
-                "执行买入",
-                security=security, event_type=ev.get("type"),
-                total_value=round(total_value, 2), available_cash=round(available_cash, 2),
-                target_trade_value=round(target_trade_value, 2), actual_trade_value=round(actual_value, 2),
-            )
-            self._record(base_row, status="EXECUTED", actual_value=round(actual_value, 2))
-            return
-
-        # direction == -1: 卖出
-        actual_value = min(target_trade_value, max(pos_value, 0.0))
-        if actual_value < self.min_trade_value:
-            self.logger.info(
-                "可卖金额不足最小门槛，跳过",
-                security=security, event_type=ev.get("type"),
-                actual_value=round(actual_value, 2), min_trade_value=self.min_trade_value,
-            )
-            self._record(base_row, status="SKIP_NO_POSITION_VALUE", actual_value=round(actual_value, 2))
-            return
-        try:
-            order_value(security, -actual_value)  # noqa: F821 - PTrade 注入
-        except Exception as e:
-            self.logger.error("order_value 调用失败", security=security, err=e, value=-actual_value)
-            self._record(base_row, status="ORDER_ERROR", actual_value=round(actual_value, 2))
-            return
-        self.logger.info(
-            "执行卖出",
-            security=security, event_type=ev.get("type"),
-            total_value=round(total_value, 2),
-            position_qty=pos_qty, position_value=round(pos_value, 2),
-            target_trade_value=round(target_trade_value, 2), actual_trade_value=round(actual_value, 2),
-        )
-        self._record(base_row, status="EXECUTED", actual_value=round(actual_value, 2))
-
-    # ----- 账户快照（健壮读取，多回退） -----
-    def _portfolio_snapshot(self, context):
-        portfolio = getattr(context, "portfolio", None)
-        debug = {"has_portfolio": portfolio is not None}
-
-        def read_attr(obj, names):
-            """依次尝试从 obj 读取 names 中的属性，返回 (value, hit_name)；都失败返回 (None, None)。"""
-            if obj is None:
-                return None, None
-            for name in names:
-                try:
-                    if hasattr(obj, name):
-                        val = getattr(obj, name)
-                        # 可调用（方法）则 call
-                        if callable(val):
-                            val = val()
-                        v = self._safe_float(val)
-                        return v, name
-                except Exception:
-                    continue
-            return None, None
-
-        # total_value / portfolio_value
-        total_value, tv_src = read_attr(portfolio, [
-            "total_value", "portfolio_value", "totalValue", "total_asset", "assets",
-        ])
-        debug["total_value_from"] = tv_src
-        if total_value is None:
-            total_value = 0.0
-
-        # available_cash 多重回退
-        available_cash, ac_src = read_attr(portfolio, [
-            "available_cash", "cash", "_cash", "starting_cash", "capital_used_cash",
-        ])
-        debug["available_cash_from"] = ac_src
-        if available_cash is None:
-            # 兜底：尝试 context.capital_base
-            cb = self._safe_float(getattr(context, "capital_base", 0.0))
-            available_cash = cb
-            debug["available_cash_from"] = "context.capital_base"
-
-        # 若 total_value 仍为 0，尝试 cash + positions_value 手工求和
-        if total_value <= 0 and portfolio is not None:
-            pv = self._safe_float(getattr(portfolio, "positions_value", 0.0))
-            total_value = available_cash + pv
-            debug["total_value_from"] = "cash+positions_value"
-
-        debug["available_cash"] = available_cash
-        debug["total_value"] = total_value
-
-        return {
-            "total_value": total_value,
-            "available_cash": available_cash,
-            "debug": debug,
-        }
-
-    # ----- 工具 -----
-    @staticmethod
-    def _current_dt(context):
-        """优先从 context.blotter.current_dt 取；退到 context.current_dt。"""
-        try:
-            return context.blotter.current_dt
-        except Exception:
-            pass
-        return getattr(context, "current_dt", None)
-
-    def _make_base_row(self, decision_dt, security, direction, ev, snap, pos_qty, pos_value, target_value):
-        action = "BUY" if direction == 1 else "SELL"
-        return {
-            "decision_dt": decision_dt,
-            "security": security,
-            "action": action,
-            "signal_type": ev.get("type", ""),
-            "signal_bar_dt": ev.get("datetime", ""),
-            "count": ev.get("count", ""),
-            "perfect": ev.get("perfect", ""),
-            "setup_type": ev.get("setup_type", ""),
-            "setup_perfect": ev.get("setup_perfect", ""),
-            "setup_first_dt": ev.get("setup_first_dt", ""),
-            "setup_last_dt": ev.get("setup_last_dt", ""),
-            "countdown_start_dt": ev.get("countdown_start_dt", ""),
-            "tdst_threshold": ev.get("tdst_threshold", ""),
-            "total_value": round(snap["total_value"], 2),
-            "available_cash": round(snap["available_cash"], 2),
-            "position_qty": pos_qty,
-            "position_value": round(pos_value, 2),
-            "target_value": round(target_value, 2),
-        }
-
-    def _record(self, base_row, status, actual_value):
-        if self.trade_recorder is None:
-            return
-        row = dict(base_row)
-        row["status"] = status
-        row["actual_value"] = actual_value
-        self.trade_recorder.record(row)
-
-    @staticmethod
-    def _safe_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return 0.0
-
-    def _get_position_snapshot(self, security):
-        """
-        返回 (仓位数量, 仓位市值)，兼容不同柜台字段命名。
-        """
-        try:
-            pos = get_position(security)  # noqa: F821 - PTrade 注入
-        except Exception:
-            pos = None
-        if pos is None:
-            return 0.0, 0.0
-
-        qty_candidates = [
-            "current_amount", "total_amount", "enable_amount", "amount", "volume", "qty",
-        ]
-        value_candidates = [
-            "market_value", "position_value", "value", "cost_balance",
-        ]
-        qty = 0.0
-        for k in qty_candidates:
-            if hasattr(pos, k):
-                qty = self._safe_float(getattr(pos, k, 0.0))
-                if qty > 0:
-                    break
-        pos_value = 0.0
-        for k in value_candidates:
-            if hasattr(pos, k):
-                pos_value = self._safe_float(getattr(pos, k, 0.0))
-                if pos_value > 0:
-                    break
-        return qty, pos_value
-
-
-# =============================================================================
-# [7.1] 交易执行层（当前版本）
-# =============================================================================
-
 COUNTDOWN_STATUS_NORMAL = "NORMAL"
 COUNTDOWN_STATUS_CANCEL_TDST_PREFIX = "CANCEL_BY_TDST_RULE_"
 COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP = "CANCEL_BY_OPPOSITE_SETUP"
@@ -1829,7 +1531,6 @@ class TradeExecutor:
 
         # 每个标的可同时跟踪多笔完整交易；每笔买入独立计算止损/止盈。
         self.open_trades = {}
-        self.closed_trade_pnls = {}
         self.pending_buy_orders = {}
         self.pending_sell_orders = {}
         self._next_trade_id = 1
@@ -2105,7 +1806,6 @@ class TradeExecutor:
             "sell_reason": sell_reason,
             "pnl": round(pnl, 2),
         })
-        self.closed_trade_pnls.setdefault(security, []).append(pnl)
         self.trade_recorder.record(row)
         self._record_position_snapshot("CLOSE", security, row, sell_date, sell_price=sell_price, sell_reason=sell_reason, pnl=pnl)
         self.logger.info("交易生命周期结束", security=security, sell_reason=sell_reason, pnl=round(pnl, 2))
@@ -2227,25 +1927,6 @@ class TradeExecutor:
         if qty > 0 and price > 0:
             return qty * price
         return self._safe_float(trade.get("buy_price")) * qty
-
-    def get_statistics_metrics(self, security, current_price):
-        pnls = self.closed_trade_pnls.get(security, [])
-        closed_count = len(pnls)
-        win_count = len([p for p in pnls if p > 0])
-        realized = sum(pnls)
-        floating = 0.0
-        price = self._safe_float(current_price)
-        for trade in self._open_trade_list(security):
-            buy_price = self._safe_float(trade.get("buy_price"))
-            qty = self._safe_float(trade.get("buy_quantity"))
-            if price > 0 and buy_price > 0 and qty > 0:
-                floating += (price - buy_price) * qty
-        return {
-            "closed_trade_count": closed_count,
-            "winning_trade_count": win_count,
-            "realized_pnl": realized,
-            "floating_pnl": floating,
-        }
 
     # ----- Helpers -----
     def _portfolio_snapshot(self, context):
@@ -2593,8 +2274,6 @@ def initialize(context):
         logger=g.logger,
         enabled=log_cfg.get("csv_output", True),
     )
-    g.statistics_recorder = None
-
     # (7) 交易执行层
     g.trade_executor = TradeExecutor(
         cfg_trade=cfg["trade"],
