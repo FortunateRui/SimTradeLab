@@ -60,7 +60,7 @@ LOADED_CONFIG_PATH = CONFIG_REL_PATH
 # 日志/CSV 中的日期时间统一格式（字符串类型）。
 DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 DATE_FMT = "%Y-%m-%d"
-EVENT_OUTCOME_WINDOWS = (1, 5, 20, 30, 60, 90, 180)
+EVENT_OUTCOME_WINDOWS = (5, 20, 60, 120)
 
 # 配置 schema 中要求必填的顶层段。缺失即视为非法配置。
 _REQUIRED_CONFIG_SECTIONS = (
