@@ -1,26 +1,26 @@
-# 基于 TD 序列的量化交易系统设计与实现
+# 基于DeMarker指标的量化交易系统的设计与实现
 
 ## 摘要
 
-量化交易系统能够将交易规则、数据处理、风险控制和评价流程转化为可重复执行的软件系统，对提高策略研究的规范性和可复现性具有重要意义。TD 序列规则链条较长，包含 Setup、Countdown、完美计数和 TDST 取消等多阶段状态，若直接采用简单条件判断实现，容易出现计数边界不清、信号重复、复权数据不一致和交易记录不可追溯等问题。本文面向 A 股日线数据、PTrade 量化交易环境和 SimTradeLab 本地回测框架，从 TD 序列状态机实现和适用性评价方法两个方面开展研究，主要工作如下。
+量化交易系统能够将交易规则、数据处理、风险控制和评价流程转化为可重复执行的软件系统，对提高策略研究的规范性和可复现性具有重要意义。本文以 DeMark 指标体系中的 TD 9-13 Sequential 作为 DeMarker 指标量化实现的核心规则。TD 序列规则链条较长，包含 Setup、Countdown、完美计数和 TDST 取消等多阶段状态，若直接采用简单条件判断实现，容易出现计数边界不清、信号重复、复权数据不一致和交易记录不可追溯等问题。本文面向 A 股日线数据、PTrade 量化交易环境和 SimTradeLab 本地回测框架，从 TD 序列状态机实现和适用性评价方法两个方面开展研究，主要工作如下。
 
 1. 针对 TD 9-13 Sequential 规则状态依赖强、计数过程易出错的问题，设计并实现了一种基于有限状态机的 TD 序列信号识别方法。该方法将 Setup 的严格连续计数、Countdown 的非连续计数、完美 Setup、完美 Countdown、TDST 取消、同向 Setup 取消和反向 Setup 取消统一建模为事件流；同时采用前复权数据全量重算和停牌过滤机制，解决了 A 股场景下历史价格可比性和信号可追溯性问题。
 
 2. 针对 TD 序列不能仅以收益率和胜率评价的问题，设计并实现了一个兼容 PTrade 接口、可在 SimTradeLab 本地回测框架中运行的量化交易系统，并提出事件研究与事件驱动回测相结合的适用性分析方案。系统实现了配置管理、行情获取、信号输出、交易生命周期记录和统计输出等功能；评价方案从信号密度、完美信号比例、取消原因分布、事件后收益、最大有利波动、最大不利波动和样本外分层表现等角度分析 TD 序列在不同市场状态和股票特征下的适用性。
 <br>
-**关键词**  TD序列  量化交易  有限状态机  回测方法  适用性分析
+**关键词**  DeMarker指标  TD序列  量化交易  有限状态机  适用性分析
 
-# Design and Implementation of Quantitative Trading System Based on TD Sequential
+# Design and Implementation of a Quantitative Trading System Based on the DeMarker Indicator
 
 ## ABSTRACT
 
-Quantitative trading systems transform trading rules, data processing, risk control, and evaluation procedures into repeatable software systems, which is meaningful for improving the standardization and reproducibility of strategy research. TD Sequential has a long rule chain and contains multi-stage states such as Setup, Countdown, perfected counting, and TDST cancellation. A direct implementation with simple conditional statements may lead to ambiguous counting boundaries, duplicated signals, inconsistent adjusted prices, and untraceable trading records. Taking A-share daily data, the PTrade quantitative trading environment, and the SimTradeLab local backtesting framework as the application context, this thesis studies TD Sequential from two aspects: state-machine-based implementation and applicability evaluation. The main work is as follows.
+Quantitative trading systems transform trading rules, data processing, risk control, and evaluation procedures into repeatable software systems, which is meaningful for improving the standardization and reproducibility of strategy research. This thesis takes TD 9-13 Sequential in the DeMark indicator system as the core rule for implementing a DeMarker-indicator-based quantitative strategy. TD Sequential has a long rule chain and contains multi-stage states such as Setup, Countdown, perfected counting, and TDST cancellation. A direct implementation with simple conditional statements may lead to ambiguous counting boundaries, duplicated signals, inconsistent adjusted prices, and untraceable trading records. Taking A-share daily data, the PTrade quantitative trading environment, and the SimTradeLab local backtesting framework as the application context, this thesis studies TD Sequential from two aspects: state-machine-based implementation and applicability evaluation. The main work is as follows.
 
 1. To solve the problems of strong state dependence and error-prone counting in TD 9-13 Sequential, a signal recognition method based on finite state machines is designed and implemented. The method models the strict consecutive counting of Setup, the non-consecutive counting of Countdown, perfected Setup, perfected Countdown, TDST cancellation, same-direction Setup cancellation, and opposite-direction Setup cancellation as a unified event flow. Meanwhile, full recalculation based on pre-adjusted prices and suspension filtering are adopted to address price comparability and signal traceability in the A-share market.
 
 2. To avoid evaluating TD Sequential only by return and win rate, a quantitative trading system compatible with PTrade APIs and runnable on the SimTradeLab local backtesting framework is designed and implemented, and an applicability analysis scheme combining event study and event-driven backtesting is proposed. The system implements configuration management, market data acquisition, signal output, trade lifecycle recording, and statistical output. The evaluation scheme analyzes the applicability of TD Sequential under different market states and stock characteristics from the perspectives of signal density, perfected signal ratio, cancellation reason distribution, post-event return, maximum favorable excursion, maximum adverse excursion, and out-of-sample stratified performance.
 <br>
-**KEY WORDS**  TD Sequential  Quantitative Trading  Finite State Machine  Backtesting Method  Applicability Analysis
+**KEY WORDS**  DeMarker Indicator  TD Sequential  Quantitative Trading  Finite State Machine  Applicability Analysis
 
 ## 目录
 
@@ -30,7 +30,7 @@ Quantitative trading systems transform trading rules, data processing, risk cont
 
 随着证券市场电子化程度的提高，交易策略从经验判断逐渐转向规则化、程序化和可验证的系统实现。量化交易的基本思想是将投资假设转化为明确的计算规则，再通过历史数据、实时数据和交易接口完成信号生成、订单执行与结果反馈。与人工主观判断相比，量化系统的优势在于可重复、可回溯、可审计，但其风险也同样明显：若规则定义不清、数据处理不一致或回测方法过度简化，历史结果可能无法反映真实可执行性。
 
-TD 序列是 DeMark 指标体系中应用较广的技术分析方法，原始思想强调以连续价格比较识别趋势耗竭，而不是简单追随趋势。官方说明将 Sequential 描述为由 Setup 和 Countdown 构成的多阶段价格比较过程，其目标是分析趋势强弱及其发生反转的可能性[^1]。DeMark 的技术分析体系强调用客观规则替代主观画线与形态识别[^2]，Perl 对多种 DeMark 指标的交易含义和使用方式进行了系统整理[^3]。从软件实现角度看，TD 序列的价值不仅在于给出买卖提示，更在于它天然具有状态机结构：Setup 要求严格连续，Countdown 允许不连续，取消条件又可能来自 TDST 突破、同向 Setup 或反向 Setup。这使得 TD 序列非常适合作为量化交易系统中“复杂技术指标工程化实现”的研究对象。
+DeMarker 指标通常用于描述 DeMark 技术分析体系下的一类价格比较型指标。本文结合系统实现难度和 A 股日线数据特点，选取 DeMark 指标体系中应用较广的 TD 9-13 Sequential 作为具体研究对象，下文简称 TD 序列。TD 序列的原始思想强调以连续价格比较识别趋势耗竭，而不是简单追随趋势。官方说明将 Sequential 描述为由 Setup 和 Countdown 构成的多阶段价格比较过程，其目标是分析趋势强弱及其发生反转的可能性[^1]。DeMark 的技术分析体系强调用客观规则替代主观画线与形态识别[^2]，Perl 对多种 DeMark 指标的交易含义和使用方式进行了系统整理[^3]。从软件实现角度看，TD 序列的价值不仅在于给出买卖提示，更在于它天然具有状态机结构：Setup 要求严格连续，Countdown 允许不连续，取消条件又可能来自 TDST 突破、同向 Setup 或反向 Setup。这使得 TD 序列非常适合作为量化交易系统中“复杂技术指标工程化实现”的研究对象。
 
 对于 A 股市场而言，TD 序列的研究还具有现实意义。A 股存在分红送转、停牌、涨跌停、ST 风险提示、退市整理和较明显的散户交易特征，直接照搬期货、外汇或指数市场中的技术指标规则，可能造成信号失真。尤其是 TD 序列依赖历史收盘价、高低价之间的相对关系，若复权方式不统一，历史序列的可比性会受到影响。因此，在 A 股环境中实现 TD 序列，需要同时处理复权数据、停牌过滤、信号时间对齐和可交易性约束。
 
