@@ -30,7 +30,7 @@ if __name__ == '__main__':
     config = BacktestConfig(
     strategy_name='my_strategy',
     # strategy_name='5mv',
-    start_date='2024-12-31',
+    start_date='2016-01-01',
     end_date='2026-01-01',
     initial_capital=1000000.0,  # 初始资金
     frequency='1d',       # '1d' 日线回测（默认），'1m' 分钟回测
