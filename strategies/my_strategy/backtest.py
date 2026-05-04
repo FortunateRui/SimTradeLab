@@ -159,7 +159,9 @@ def load_config(config_rel_path):
     global LOADED_CONFIG_PATH
     full_path = _join_research_path(config_rel_path)
     f = None
-    read_path = full_path
+    # PTrade 环境中后续 create_dir/open 都应使用研究目录相对路径；
+    # 本地 fallback 才记录本地项目路径，避免把 get_research_path() 拼接两次。
+    read_path = config_rel_path
     errors = []
     try:
         f = open(full_path, "r", encoding="utf-8")
@@ -218,20 +220,22 @@ def prepare_output_dir(start_date_str, config_rel_path):
         * 占用目录：写入 .initialized，下次其它 run 就能看到
 
     返回:
-        (rel_dir, abs_dir) 二元组。rel_dir 相对研究目录；abs_dir 为绝对路径。
+        (rel_dir, write_dir) 二元组。rel_dir 相对研究目录；write_dir 为实际传给 open()
+        的路径。PTrade 下使用相对路径，本地 fallback 下使用本地项目路径。
     """
     parent_rel, _ = _split_parent_rel(config_rel_path)
     base_name = start_date_str
-    if _is_local_project_path(config_rel_path):
-        parent_abs = parent_rel.rstrip("/\\")
+    is_local_path = _is_local_project_path(config_rel_path)
+    if is_local_path:
+        parent_write = parent_rel.rstrip("/\\")
     else:
-        parent_abs = _join_research_path(parent_rel).rstrip("/\\")
+        parent_write = parent_rel.rstrip("/\\")
 
     # 先尝试确保父目录存在（与 config.json 同级）。如果本来就存在，
     # PTrade 的 create_dir 一般也会静默返回。
     if parent_rel:
         try:
-            if not _is_local_project_path(config_rel_path):
+            if not is_local_path:
                 create_dir(parent_rel)  # noqa: F821 - PTrade 注入
         except Exception:
             pass
@@ -239,21 +243,21 @@ def prepare_output_dir(start_date_str, config_rel_path):
     for suffix in range(0, _MAX_DIR_SUFFIX_TRIES):
         candidate = base_name if suffix == 0 else "{}_{}".format(base_name, suffix)
         candidate_rel = (parent_rel + "/" + candidate) if parent_rel else candidate
-        candidate_abs = parent_abs + "/" + candidate
+        candidate_write = (parent_write + "/" + candidate) if parent_write else candidate
 
         # 目录中已有 .initialized 标记 → 说明是之前某一次运行留下来的
-        if _file_exists(candidate_abs + "/" + _RUN_MARKER_NAME):
+        if _file_exists(candidate_write + "/" + _RUN_MARKER_NAME):
             continue
 
         # 试着创建目录（若已存在且为空，PTrade 的 create_dir 一般不会抛错；
         # 若抛错则视为创建失败，尝试下一个后缀）。
         try:
-            if _is_local_project_path(config_rel_path):
+            if is_local_path:
                 # 本地 SimTradeLab 环境允许使用 pathlib / os，但策略文件为了兼容 PTrade
                 # 不 import os；这里用 open marker 的父目录创建能力不可用，因此退化为
                 # Python 内置 __import__ 动态导入 pathlib，只在本地路径分支执行。
                 pathlib = __import__("pathlib")
-                pathlib.Path(candidate_abs).mkdir(parents=True, exist_ok=False)
+                pathlib.Path(candidate_write).mkdir(parents=True, exist_ok=False)
             else:
                 create_dir(candidate_rel)  # noqa: F821 - PTrade 注入
         except Exception:
@@ -262,7 +266,7 @@ def prepare_output_dir(start_date_str, config_rel_path):
 
         # 标记这个目录为"本次运行占用"。marker 写入失败不致命，最多下次同日运行覆盖。
         try:
-            mf = open(candidate_abs + "/" + _RUN_MARKER_NAME, "w", encoding="utf-8")
+            mf = open(candidate_write + "/" + _RUN_MARKER_NAME, "w", encoding="utf-8")
             try:
                 mf.write("run_start={}\nsuffix={}\n".format(start_date_str, suffix))
             finally:
@@ -270,11 +274,12 @@ def prepare_output_dir(start_date_str, config_rel_path):
         except Exception:
             pass
 
-        return candidate_rel, candidate_abs
+        return candidate_rel, candidate_write
 
     # 兜底：超出尝试上限仍未成功，退化为不带后缀，交由 PTrade 决定
     fallback_rel = (parent_rel + "/" + base_name) if parent_rel else base_name
-    return fallback_rel, parent_abs + "/" + base_name
+    fallback_write = (parent_write + "/" + base_name) if parent_write else base_name
+    return fallback_rel, fallback_write
 
 
 # =============================================================================
