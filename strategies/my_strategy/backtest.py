@@ -159,7 +159,8 @@ def load_config(config_rel_path):
     global LOADED_CONFIG_PATH
     full_path = _join_research_path(config_rel_path)
     f = None
-    # PTrade 环境中后续 create_dir/open 都应使用研究目录相对路径；
+    # PTrade 主路径加载成功时记录原始相对路径；后续 create_dir 用相对路径，
+    # open 写文件时再用 get_research_path() 拼成完整路径。
     # 本地 fallback 才记录本地项目路径，避免把 get_research_path() 拼接两次。
     read_path = config_rel_path
     errors = []
@@ -220,8 +221,9 @@ def prepare_output_dir(start_date_str, config_rel_path):
         * 占用目录：写入 .initialized，下次其它 run 就能看到
 
     返回:
-        (rel_dir, write_dir) 二元组。rel_dir 相对研究目录；write_dir 为实际传给 open()
-        的路径。PTrade 下使用相对路径，本地 fallback 下使用本地项目路径。
+        (rel_dir, write_dir) 二元组。rel_dir 相对研究目录，传给 create_dir；
+        write_dir 为实际传给 open() 的目录。PTrade 下是 get_research_path()
+        拼出的完整路径，本地 fallback 下是本地项目路径。
     """
     parent_rel, _ = _split_parent_rel(config_rel_path)
     base_name = start_date_str
@@ -229,7 +231,7 @@ def prepare_output_dir(start_date_str, config_rel_path):
     if is_local_path:
         parent_write = parent_rel.rstrip("/\\")
     else:
-        parent_write = parent_rel.rstrip("/\\")
+        parent_write = _join_research_path(parent_rel).rstrip("/\\") if parent_rel else _join_research_path("").rstrip("/\\")
 
     # 先尝试确保父目录存在（与 config.json 同级）。如果本来就存在，
     # PTrade 的 create_dir 一般也会静默返回。
