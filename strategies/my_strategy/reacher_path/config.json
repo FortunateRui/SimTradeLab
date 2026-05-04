@@ -5025,7 +5025,7 @@
         "frequency": "1d",
         "fq": "pre",
         "lookback_count": 200,
-        "min_required_bars": 20
+        "min_required_bars": 120
     },
 
     "backtest": {
