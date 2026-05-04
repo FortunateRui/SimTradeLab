@@ -60,6 +60,7 @@ LOADED_CONFIG_PATH = CONFIG_REL_PATH
 # 日志/CSV 中的日期时间统一格式（字符串类型）。
 DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 DATE_FMT = "%Y-%m-%d"
+EVENT_OUTCOME_WINDOWS = (1, 5, 20, 30, 60, 90, 180)
 
 # 配置 schema 中要求必填的顶层段。缺失即视为非法配置。
 _REQUIRED_CONFIG_SECTIONS = (
@@ -1289,7 +1290,7 @@ class MetadataRecorder:
     """
 
     HEADER_FIELDS = [
-        "datetime", "security", "frequency", "category", "type",
+        "event_id", "datetime", "security", "frequency", "category", "type",
         "direction", "count", "perfect", "reason",
         "setup_type", "setup_perfect", "setup_first_dt", "setup_last_dt",
         "setup_highest_high", "tdst_threshold", "countdown_start_dt",
@@ -1307,6 +1308,11 @@ class MetadataRecorder:
         "sell_price", "sell_reason", "pnl",
         "total_value", "available_cash",
     ]
+    OUTCOME_HEADER_FIELDS = [
+        "event_id", "event_datetime", "security", "type", "direction", "window",
+        "matured_datetime", "base_close", "end_close",
+        "directional_return", "mfe", "mae",
+    ]
 
     def __init__(self, output_dir_abs, logger, enabled=True):
         """
@@ -1323,6 +1329,9 @@ class MetadataRecorder:
     def _position_csv_path(self):
         return "{}/position_snapshot.csv".format(self.output_dir_abs)
 
+    def _outcomes_csv_path(self):
+        return "{}/event_outcomes.csv".format(self.output_dir_abs)
+
     def write_events(self, events):
         if not self.enabled or not events:
             return
@@ -1332,6 +1341,11 @@ class MetadataRecorder:
         if not self.enabled:
             return
         self._write_rows(self._position_csv_path(), self.POSITION_HEADER_FIELDS, [row], "仓位元数据")
+
+    def write_event_outcomes(self, rows):
+        if not self.enabled or not rows:
+            return
+        self._write_rows(self._outcomes_csv_path(), self.OUTCOME_HEADER_FIELDS, rows, "事件窗口结果元数据")
 
     def _write_rows(self, path, header_fields, rows, label):
         try:
@@ -2403,9 +2417,121 @@ def _enrich_events_with_bar_context(events, bars):
             volatility = variance ** 0.5
 
     for ev in events:
+        if not ev.get("event_id"):
+            ev["event_id"] = _make_event_id(ev)
         ev["pre20_avg_amount"] = round(avg_amount, 4) if avg_amount != "" else ""
         ev["pre20_return"] = round(pre20_return, 6) if pre20_return != "" else ""
         ev["pre20_volatility"] = round(volatility, 6) if volatility != "" else ""
+
+
+def _make_event_id(ev):
+    raw = "{}|{}|{}|{}|{}|{}".format(
+        ev.get("security", ""),
+        ev.get("datetime", ""),
+        ev.get("type", ""),
+        ev.get("direction", ""),
+        ev.get("setup_last_dt", ""),
+        ev.get("count", ""),
+    )
+    return raw.replace(" ", "T").replace(":", "").replace("|", "_").replace(".", "")
+
+
+def _update_pending_event_outcomes(pending_events, security, bars, recorder):
+    if not pending_events or not bars or recorder is None:
+        return
+    security_events = pending_events.get(security, [])
+    if not security_events:
+        return
+    index_by_dt = {}
+    for idx, bar in enumerate(bars):
+        index_by_dt[bar.datetime] = idx
+    outcome_rows = []
+    still_pending = []
+    for ev in security_events:
+        event_dt = ev.get("datetime", "")
+        event_idx = index_by_dt.get(event_dt)
+        if event_idx is None:
+            # lookback 窗口已无法覆盖该事件，保守丢弃，避免无限增长。
+            continue
+        completed_windows = ev.setdefault("_completed_windows", {})
+        for window in EVENT_OUTCOME_WINDOWS:
+            if completed_windows.get(window):
+                continue
+            matured_idx = event_idx + int(window)
+            if matured_idx >= len(bars):
+                continue
+            row = _make_event_outcome_row(ev, bars, event_idx, matured_idx, window)
+            if row is not None:
+                outcome_rows.append(row)
+                completed_windows[window] = True
+        if len(completed_windows) < len(EVENT_OUTCOME_WINDOWS):
+            still_pending.append(ev)
+    if outcome_rows:
+        recorder.write_event_outcomes(outcome_rows)
+    if still_pending:
+        pending_events[security] = still_pending
+    elif security in pending_events:
+        del pending_events[security]
+
+
+def _should_track_event_outcome(ev):
+    typ = ev.get("type", "")
+    if _safe_int(ev.get("direction", 0)) == 0:
+        return False
+    if "PROGRESS" in typ or "TENTATIVE" in typ:
+        return False
+    return typ.startswith("BUY_SETUP") or typ.startswith("SELL_SETUP") or "COUNTDOWN_COMPLETE" in typ or "COUNTDOWN_CANCEL" in typ
+
+
+def _make_event_outcome_row(ev, bars, event_idx, matured_idx, window):
+    direction = _safe_int(ev.get("direction", 0))
+    if direction == 0:
+        return None
+    base_close = _safe_float_value(ev.get("bar_close"))
+    if base_close <= 0:
+        base_close = bars[event_idx].close
+    if base_close <= 0:
+        return None
+    end_bar = bars[matured_idx]
+    end_close = end_bar.close
+    directional_return = direction * (end_close / base_close - 1.0)
+    window_bars = bars[event_idx + 1:matured_idx + 1]
+    if not window_bars:
+        return None
+    if direction > 0:
+        mfe = max(b.high / base_close - 1.0 for b in window_bars)
+        mae = min(b.low / base_close - 1.0 for b in window_bars)
+    else:
+        mfe = max(1.0 - b.low / base_close for b in window_bars)
+        mae = min(1.0 - b.high / base_close for b in window_bars)
+    return {
+        "event_id": ev.get("event_id", _make_event_id(ev)),
+        "event_datetime": ev.get("datetime", ""),
+        "security": ev.get("security", ""),
+        "type": ev.get("type", ""),
+        "direction": direction,
+        "window": window,
+        "matured_datetime": end_bar.datetime,
+        "base_close": round(base_close, 6),
+        "end_close": round(end_close, 6),
+        "directional_return": round(directional_return, 8),
+        "mfe": round(mfe, 8),
+        "mae": round(mae, 8),
+    }
+
+
+def _safe_float_value(value):
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _safe_int(value):
+    try:
+        return int(float(value))
+    except Exception:
+        return 0
 
 
 def initialize(context):
@@ -2479,6 +2605,7 @@ def initialize(context):
 
     # (8) 当日有效（非停牌）标的列表，由 before_trading_start 每日刷新
     g.active_securities_today = list(g.securities)
+    g.pending_event_outcomes = {}
 
     g.logger.info(
         "策略初始化完成",
@@ -2558,6 +2685,7 @@ def handle_data(context, data):
             continue
 
         last_bar_dt = bars[-1].datetime  # 昨日（或更早的已收盘 K 线）
+        _update_pending_event_outcomes(g.pending_event_outcomes, security, bars, g.recorder)
 
         # 回测降级：没有 tick_data / on_trade_response 时，用上一根已完成 K 线的 high/low
         # 追踪已有仓位的止盈止损。实盘环境中该逻辑由 tick_data 负责。
@@ -2574,6 +2702,9 @@ def handle_data(context, data):
 
         if last_bar_events:
             _enrich_events_with_bar_context(last_bar_events, bars)
+            for ev in last_bar_events:
+                if _should_track_event_outcome(ev):
+                    g.pending_event_outcomes.setdefault(security, []).append(dict(ev))
             # (5) 交易层：按"昨日信号 → 今日下单"的时序执行
             g.trade_executor.execute_for_events(
                 context=context,

@@ -9,10 +9,11 @@
 | 文件 | 来源 | 说明 |
 | --- | --- | --- |
 | `td_events.csv` | `backtest.py` | TD Setup / Countdown 完成与取消等事件元数据 |
+| `event_outcomes.csv` | `backtest.py` | 事件窗口成熟后写出的方向收益、MFE、MAE |
 | `trade.csv` | `backtest.py` | 全部标的交易生命周期汇总 |
 | `position_snapshot.csv` | `backtest.py` | 开仓和平仓时的轻量仓位快照，当前工具预留读取口径 |
 
-如果配置了本地数据目录 `DATA_ROOT`，且环境可读取 parquet，脚本会尝试读取 `data/stocks/<SEC>.parquet` 来计算事件窗口收益、MFE 和 MAE。没有行情数据时，交易汇总和分层统计仍可生成，但事件窗口收益相关字段会留空。
+工具只读取策略输出目录中的元数据文件，不读取 `data/` 目录、不读取 parquet，也不依赖 PTrade。若缺少 `event_outcomes.csv`，说明策略运行时尚未生成事件窗口结果，需要重新运行策略或扩大回测区间让事件窗口成熟。
 
 ## 配置方式
 
@@ -20,7 +21,6 @@
 
 ```python
 TARGET_RUN_FOLDER = "../reacher_path/2021-01-01"
-DATA_ROOT = "../../../data"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 INITIAL_CAPITAL = 1_000_000.0
 EVENT_WINDOWS = [1, 5, 20, 30, 60, 90, 180]
@@ -32,7 +32,6 @@ SINGLE_STOCK_TRADE_MIN_COUNT = 10
 
 ```bash
 python strategies/my_strategy/tool/thesis_analysis_tool.py ../reacher_path/2021-01-01
-python strategies/my_strategy/tool/thesis_analysis_tool.py ../reacher_path/2021-01-01 --data-root ../../../data
 ```
 
 在项目虚拟环境中运行：
@@ -67,7 +66,7 @@ thesis_analysis/
 - `Sell Countdown Complete`
 - `Countdown Cancel`
 
-若可读取行情数据，则对每个事件窗口计算：
+事件窗口结果来自策略输出的 `event_outcomes.csv`，工具不再读取行情源数据。对每个事件窗口统计：
 
 - 方向收益率：`direction * (future_close / event_close - 1)`
 - 方向胜率：方向收益率大于 0 的比例
@@ -126,6 +125,7 @@ thesis_analysis/
 
 ## 注意事项
 
-- 该工具只读取策略输出和本地行情文件，不会修改原始回测结果。
+- 该工具只读取策略输出元数据，不会读取 `data/` 行情目录，也不会修改原始回测结果。
 - 图表使用 `matplotlib` 的 `Agg` 后端，适合在终端或服务器环境生成 PNG。
-- 如果本机 `matplotlib` 或 parquet 依赖不可用，优先保证 CSV 表格输出；缺失的图表或事件窗口收益可在依赖安装后重新运行生成。
+- 进度条优先使用 `tqdm`；如果当前 Python 环境没有安装 `tqdm`，会自动降级为普通阶段提示。
+- 如果本机 `matplotlib` 不可用，优先保证 CSV 表格输出；缺失的图表可在依赖安装后重新运行生成。

@@ -23,7 +23,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 # =============================================================================
 
 TARGET_RUN_FOLDER = "../reacher_path/2021-01-01"
-DATA_ROOT = "../../../data"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 
 INITIAL_CAPITAL = 1_000_000.0
@@ -52,7 +51,6 @@ def resolve_path(value: str) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate TD thesis analysis tables and charts.")
     parser.add_argument("run_folder", nargs="?", default=TARGET_RUN_FOLDER)
-    parser.add_argument("--data-root", default=DATA_ROOT)
     return parser.parse_args()
 
 
@@ -119,6 +117,31 @@ def fmt(value: Optional[float], digits: int = 6) -> str:
     return str(round(value, digits))
 
 
+def iter_progress(iterable, desc: str = "", total: Optional[int] = None):
+    try:
+        from tqdm import tqdm  # type: ignore
+        return tqdm(iterable, desc=desc, total=total)
+    except Exception:
+        if desc:
+            print("{}...".format(desc))
+        return iterable
+
+
+def make_event_id(row: Dict[str, str]) -> str:
+    existing = str(row.get("event_id", "")).strip()
+    if existing:
+        return existing
+    raw = "{}|{}|{}|{}|{}|{}".format(
+        row.get("security", ""),
+        row.get("datetime", ""),
+        row.get("type", ""),
+        row.get("direction", ""),
+        row.get("setup_last_dt", ""),
+        row.get("count", ""),
+    )
+    return raw.replace(" ", "T").replace(":", "").replace("|", "_").replace(".", "")
+
+
 # =============================================================================
 # CSV I/O
 # =============================================================================
@@ -141,70 +164,6 @@ def write_csv(path: Path, rows: List[Dict[str, object]], header: Sequence[str]) 
 
 
 # =============================================================================
-# Optional Price Data
-# =============================================================================
-
-class PriceStore:
-    def __init__(self, data_root: Path):
-        self.data_root = data_root
-        self._cache: Dict[str, Optional[List[Dict[str, object]]]] = {}
-        self._pandas = None
-
-    def _load_pandas(self):
-        if self._pandas is not None:
-            return self._pandas
-        try:
-            import pandas as pd  # type: ignore
-            self._pandas = pd
-        except Exception:
-            self._pandas = False
-        return self._pandas
-
-    def load(self, security: str) -> Optional[List[Dict[str, object]]]:
-        if security in self._cache:
-            return self._cache[security]
-        pd = self._load_pandas()
-        if pd is False:
-            self._cache[security] = None
-            return None
-        candidates = [
-            self.data_root / "stocks" / "{}.parquet".format(security),
-            self.data_root / "{}.parquet".format(security),
-        ]
-        path = next((p for p in candidates if p.exists()), None)
-        if path is None:
-            self._cache[security] = None
-            return None
-        try:
-            df = pd.read_parquet(path)
-            if "date" in df.columns:
-                df = df.copy()
-                df["date"] = pd.to_datetime(df["date"])
-            else:
-                df = df.reset_index().rename(columns={"index": "date"})
-                df["date"] = pd.to_datetime(df["date"])
-            rows = []
-            for _, row in df.sort_values("date").iterrows():
-                rows.append({
-                    "date": row["date"].strftime("%Y-%m-%d"),
-                    "close": float(row.get("close", 0.0)),
-                    "high": float(row.get("high", row.get("close", 0.0))),
-                    "low": float(row.get("low", row.get("close", 0.0))),
-                })
-            self._cache[security] = rows
-            return rows
-        except Exception:
-            self._cache[security] = None
-            return None
-
-    def index_at_or_after(self, series: List[Dict[str, object]], event_date: str) -> Optional[int]:
-        for i, row in enumerate(series):
-            if str(row["date"]) >= event_date:
-                return i
-        return None
-
-
-# =============================================================================
 # Event Study
 # =============================================================================
 
@@ -223,34 +182,25 @@ def event_group(row: Dict[str, str]) -> str:
     return typ or "Unknown"
 
 
-def directional_metrics(row: Dict[str, str], price_store: PriceStore, window: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    security = row.get("security", "")
-    event_date = date_key(row.get("datetime", ""))
-    direction = int(parse_float(row.get("direction")) or 0)
-    if direction == 0:
+def build_outcome_index(outcomes: List[Dict[str, str]]) -> Dict[Tuple[str, int], Dict[str, str]]:
+    index: Dict[Tuple[str, int], Dict[str, str]] = {}
+    for row in iter_progress(outcomes, desc="Indexing event outcomes", total=len(outcomes)):
+        event_id = str(row.get("event_id", "")).strip()
+        window = int(parse_float(row.get("window")) or 0)
+        if event_id and window:
+            index[(event_id, window)] = row
+    return index
+
+
+def directional_metrics(row: Dict[str, str], outcome_index: Dict[Tuple[str, int], Dict[str, str]], window: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    outcome = outcome_index.get((make_event_id(row), window))
+    if not outcome:
         return None, None, None
-    series = price_store.load(security)
-    if not series:
-        return None, None, None
-    idx = price_store.index_at_or_after(series, event_date)
-    if idx is None or idx >= len(series):
-        return None, None, None
-    end_idx = idx + window
-    if end_idx >= len(series):
-        return None, None, None
-    base = parse_float(row.get("bar_close")) or float(series[idx]["close"])
-    if base <= 0:
-        return None, None, None
-    end_close = float(series[end_idx]["close"])
-    directional_return = direction * (end_close / base - 1.0)
-    window_rows = series[idx + 1:end_idx + 1]
-    if direction > 0:
-        mfe = max(float(r["high"]) / base - 1.0 for r in window_rows)
-        mae = min(float(r["low"]) / base - 1.0 for r in window_rows)
-    else:
-        mfe = max(1.0 - float(r["low"]) / base for r in window_rows)
-        mae = min(1.0 - float(r["high"]) / base for r in window_rows)
-    return directional_return, mfe, mae
+    return (
+        parse_float(outcome.get("directional_return")),
+        parse_float(outcome.get("mfe")),
+        parse_float(outcome.get("mae")),
+    )
 
 
 def summarize_values(values: Sequence[float], prefix: str) -> Dict[str, str]:
@@ -265,20 +215,21 @@ def summarize_values(values: Sequence[float], prefix: str) -> Dict[str, str]:
     }
 
 
-def build_event_study(events: List[Dict[str, str]], price_store: PriceStore) -> List[Dict[str, object]]:
+def build_event_study(events: List[Dict[str, str]], outcome_index: Dict[Tuple[str, int], Dict[str, str]]) -> List[Dict[str, object]]:
     grouped: Dict[str, List[Dict[str, str]]] = {}
     for row in events:
         grouped.setdefault(event_group(row), []).append(row)
 
     output: List[Dict[str, object]] = []
-    for group, rows in sorted(grouped.items()):
+    grouped_items = sorted(grouped.items())
+    for group, rows in iter_progress(grouped_items, desc="Building event study", total=len(grouped_items)):
         out: Dict[str, object] = {"event_group": group, "event_count": len(rows)}
         for window in EVENT_WINDOWS:
             returns: List[float] = []
             mfes: List[float] = []
             maes: List[float] = []
             for row in rows:
-                ret, mfe, mae = directional_metrics(row, price_store, window)
+                ret, mfe, mae = directional_metrics(row, outcome_index, window)
                 if ret is not None:
                     returns.append(ret)
                 if mfe is not None:
@@ -422,7 +373,7 @@ def trade_win_rate_from_pnls(pnls: Sequence[float]) -> Optional[float]:
 def split_consistency(
     events: List[Dict[str, str]],
     trades: List[Dict[str, str]],
-    price_store: PriceStore,
+    outcome_index: Dict[Tuple[str, int], Dict[str, str]],
 ) -> str:
     if not events:
         return "False"
@@ -436,7 +387,7 @@ def split_consistency(
     for part in parts:
         returns = []
         for row in part:
-            ret, _, _ = directional_metrics(row, price_store, 20)
+            ret, _, _ = directional_metrics(row, outcome_index, 20)
             if ret is not None:
                 returns.append(ret)
         med = quantile(returns, 0.5)
@@ -459,7 +410,7 @@ def split_consistency(
 def build_single_stock_applicability(
     events: List[Dict[str, str]],
     trades: List[Dict[str, str]],
-    price_store: PriceStore,
+    outcome_index: Dict[Tuple[str, int], Dict[str, str]],
 ) -> List[Dict[str, object]]:
     buy_events = [row for row in events if is_buy_countdown_complete(row)]
     completed = completed_trades(trades)
@@ -472,14 +423,15 @@ def build_single_stock_applicability(
         trades_by_stock.setdefault(row.get("security", ""), []).append(row)
 
     raw_rows: List[Dict[str, object]] = []
-    for security in sorted(set(events_by_stock.keys()) | set(trades_by_stock.keys())):
+    securities = sorted(set(events_by_stock.keys()) | set(trades_by_stock.keys()))
+    for security in iter_progress(securities, desc="Building single-stock applicability", total=len(securities)):
         stock_events = events_by_stock.get(security, [])
         stock_trades = trades_by_stock.get(security, [])
         returns: List[float] = []
         mfes: List[float] = []
         maes: List[float] = []
         for event in stock_events:
-            ret, mfe, mae = directional_metrics(event, price_store, 20)
+            ret, mfe, mae = directional_metrics(event, outcome_index, 20)
             if ret is not None:
                 returns.append(ret)
             if mfe is not None:
@@ -500,7 +452,7 @@ def build_single_stock_applicability(
             "avg_profit_loss_ratio": pl_ratio,
             "max_drawdown": max_drawdown_from_pnls(pnls),
             "execution_rate": safe_div(float(len(stock_trades)), float(len(stock_events))) if stock_events else None,
-            "split_consistent": split_consistency(stock_events, stock_trades, price_store),
+            "split_consistent": split_consistency(stock_events, stock_trades, outcome_index),
         }
         raw_rows.append(row)
 
@@ -729,16 +681,16 @@ def save_single_stock_chart(rows: List[Dict[str, object]], output_dir: Path) -> 
 def main() -> None:
     args = parse_args()
     run_dir = resolve_path(args.run_folder)
-    data_root = resolve_path(args.data_root)
     output_dir = run_dir / OUTPUT_FOLDER_NAME
     if not run_dir.exists() or not run_dir.is_dir():
         raise FileNotFoundError("Run folder not found: {}".format(run_dir))
 
     events = read_csv(run_dir / "td_events.csv")
+    outcomes = read_csv(run_dir / "event_outcomes.csv")
     trades = read_csv(run_dir / "trade.csv")
-    price_store = PriceStore(data_root)
+    outcome_index = build_outcome_index(outcomes)
 
-    event_rows = build_event_study(events, price_store)
+    event_rows = build_event_study(events, outcome_index)
     event_header = ["event_group", "event_count"]
     for window in EVENT_WINDOWS:
         event_header.extend([
@@ -748,7 +700,7 @@ def main() -> None:
         ])
     write_csv(output_dir / "event_study_summary.csv", event_rows, event_header)
 
-    trade_rows = summarize_trades(trades)
+    trade_rows = summarize_trades(list(iter_progress(trades, desc="Summarizing trades", total=len(trades))))
     trade_header = [
         "scenario", "trade_count", "win_rate", "avg_profit_loss_ratio",
         "total_pnl", "total_return", "max_drawdown", "sharpe",
@@ -763,7 +715,7 @@ def main() -> None:
     ]
     write_csv(output_dir / "stratified_summary.csv", strat_rows, strat_header)
 
-    stock_rows = build_single_stock_applicability(events, trades, price_store)
+    stock_rows = build_single_stock_applicability(events, trades, outcome_index)
     stock_header = [
         "security", "event_count", "completed_trade_count",
         "ret_20d_median", "mfe_20d_median", "mae_20d_median",
