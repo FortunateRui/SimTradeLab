@@ -188,25 +188,38 @@ Countdown 的取消规则决定了一个 TD 信号生命周期是否仍然有效
 
 TDST 阈值提供五种规则配置。以 Buy Countdown 为例，规则可选择 Setup 阶段最高收盘价、最高最高价、收盘价突破最高收盘价、收盘价突破最高最高价或收盘价突破真实最高价。Sell Countdown 对应使用最低价方向。不同规则的保守程度不同，阈值越容易突破，Countdown 被取消的频率越高。系统默认采用“收盘价突破 Setup 阶段最高最高价”的规则，以减少盘中噪声对取消判断的影响。
 
-### 3.5 信号输出字段设计
+### 3.5 TD事件元数据字段设计
 
-为了支持后续适用性分析，信号输出不仅记录事件类型，还记录事件上下文。`signnal.csv` 按股票分流保存，字段包括事件日期、股票代码、周期、事件类别、事件类型、方向、计数、完美状态、取消原因、Setup 起止日期、Setup 阶段最高价、TDST 阈值、Countdown 起始日期、各计数日日期、计数第 8 日收盘价、Countdown 阶段最低价和事件 K 线价格。
+为了支持后续事件研究、分层统计和一致性验证，系统不仅输出信号类型，还输出能够复盘信号生成过程的 TD 事件元数据。当前实现将 Setup、Countdown 完成、Countdown 取消和 Countdown 进位等事件统一写入运行根目录下的 `td_events.csv`，避免大规模回测时生成大量按股票拆分的中间文件。该文件以 `event_id` 作为事件唯一标识，记录事件日期、股票代码、周期、事件类别、事件类型、方向、计数、完美状态、取消原因、Setup 起止日期、Setup 阶段最高价、TDST 阈值、Countdown 起始日期、各计数日日期、计数第 8 日收盘价、Countdown 阶段最低价、事件 K 线价格以及事件日前 20 个交易日的成交额、波动率和收益率等上下文字段。
 
-表3-3  关键信号字段表
+在事件窗口成熟后，系统另行生成 `event_outcomes.csv`，通过 `event_id` 与 `td_events.csv` 对应，记录事件窗口、到期日期、方向收益率、最大有利波动和最大不利波动。这样可以将“信号生成事实”和“事件后表现结果”分离保存，既便于复核 TD 状态机输出，也便于第五章在不同窗口和不同分组下进行统计分析。
+
+表3-3  TD事件元数据字段表
 
 | 字段 | 说明 | 适用分析 |
 | ---- | ---- | ---- |
+| event_id | 事件唯一标识 | 连接事件元数据和事件窗口结果 |
+| datetime | 事件发生日期 | 定位事件日和事件窗口起点 |
+| security | 股票代码 | 个股适用性和分层统计 |
+| category | 事件类别 | 区分 Setup、Countdown 和取消事件 |
+| type | 事件类型 | 区分完成、进位、暂记和取消 |
+| direction | 事件方向 | 计算方向收益和方向胜率 |
 | setup_first_dt | Setup 第一根日期 | 计算 Setup 持续区间 |
 | setup_last_dt | Setup 第九根完成日期 | 定位生命周期起点 |
 | setup_perfect | 是否完美 Setup | 比较完美与非完美信号差异 |
+| tdst_threshold | TDST 取消阈值 | 分析取消规则和失效边界 |
 | count_1_dt 至 count_13_dt | Countdown 各计数日期 | 分析计数节奏和时间跨度 |
 | countdown_8_close | 第 8 个计数日收盘价 | 判断完美 Countdown |
 | countdown_low | Countdown 阶段最低价 | 计算 TD 风险价位 |
 | reason | 取消原因 | 分析失效模式 |
+| bar_close、bar_high、bar_low | 事件日价格 | 复核事件触发条件和风险价位 |
+| pre20_avg_amount | 事件日前 20 日平均成交额 | 流动性分层 |
+| pre20_volatility | 事件日前 20 日波动率 | 波动率分层 |
+| pre20_return | 事件日前 20 日收益率 | 市场状态分层 |
 
 ### 3.6 本章小结
 
-本章将 TD 序列信号识别拆解为 SetupMachine、CountdownMachine 和 TDSignalProcessor 三部分。SetupMachine 解决严格连续计数问题，CountdownMachine 解决非连续计数和取消问题，处理器负责事件编排。通过结构化事件输出，系统为后续回测和适用性分析保留了完整上下文。
+本章将 TD 序列信号识别拆解为 SetupMachine、CountdownMachine 和 TDSignalProcessor 三部分。SetupMachine 解决严格连续计数问题，CountdownMachine 解决非连续计数和取消问题，处理器负责事件编排。通过 `td_events.csv` 和 `event_outcomes.csv` 的结构化输出，系统为后续回测和适用性分析保留了完整上下文。
 
 ## 第四章 量化交易系统设计与实现
 
@@ -261,7 +274,7 @@ MarketDataFetcher 将外部行情数据转换为内部 `Bar` 对象，统一字�
 
 ### 4.6 交易与风控规则实现
 
-交易层默认只根据 Buy Countdown 完成信号进行买入，Sell Countdown 默认保留为信号，不直接用于卖出。若配置开启 `take_profit_on_sell_countdown`，则 Sell Countdown 完成且当前仓位盈利时可作为趋势反转止盈信号。每次买入使用总资产固定比例，默认 10%，并设置最小交易金额和最小现金要求，防止过小订单和近似满仓状态下继续下单。
+交易层默认只根据 Buy Countdown 完成信号进行买入，Sell Countdown 默认保留为信号，不直接用于卖出。若配置开启 `take_profit_on_sell_countdown`，则 Sell Countdown 完成且当前仓位盈利时可作为趋势反转止盈信号。每次买入使用总资产固定比例，默认 1%，并设置最小交易金额和最小现金要求，防止过小订单和近似满仓状态下继续下单。
 
 止损价基于 TD 序列建议的风险价位计算。系统在 Countdown 阶段找到最低价所在 K 线，将该 K 线最低价减去其高低价差的一定倍数作为止损价；止盈价采用 1.5R 规则，即买入价与止损价之间的风险距离乘以 1.5 后加到买入价上。实盘环境中，成交价和数量以 `on_trade_response` 的成交回报为准，止盈止损在 `tick_data` 中逐 tick 追踪；回测环境中则降级为在后续已完成 K 线上使用最高价和最低价判断触发。
 
