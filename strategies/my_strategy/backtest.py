@@ -2625,6 +2625,7 @@ def handle_data(context, data):
             current_dt = context.blotter.current_dt
             query_date = current_dt.strftime("%Y%m%d")
         except Exception:
+            current_dt = getattr(context, "current_dt", None)
             query_date = None
 
         if MarketDataFetcher.is_halt_today(security, query_date):
@@ -2642,14 +2643,15 @@ def handle_data(context, data):
 
         # 回测降级：没有 tick_data / on_trade_response 时，用上一根已完成 K 线的 high/low
         # 追踪已有仓位的止盈止损。实盘环境中该逻辑由 tick_data 负责。
+        current_dt_text = _format_dt(current_dt)
         g.trade_executor.accrue_dividends(
             security=security,
-            dt_text=_format_dt(g.current_dt),
+            dt_text=current_dt_text,
         )
         g.trade_executor.reconcile_position_adjustments(
             context=context,
             security=security,
-            dt_text=_format_dt(g.current_dt),
+            dt_text=current_dt_text,
         )
         g.trade_executor.check_backtest_exits(context, security, bars[-1])
 
