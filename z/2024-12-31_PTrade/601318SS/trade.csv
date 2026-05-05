@@ -1,4 +1,0 @@
-datetime,security,setup_completed_at,setup_is_perfect,setup_highest_high,count_1_at,count_2_at,count_3_at,count_4_at,count_5_at,count_6_at,count_7_at,count_8_at,count_8_close,count_9_at,count_10_at,count_11_at,count_12_at,count_13_at,countdown_completed_count,countdown_is_perfect,countdown_status,bought,buy_reject_reason,buy_quantity,buy_price,buy_date,entry_value,stop_loss_price,take_profit_price,sell_price,sell_date,sell_reason,pnl
-2025-02-19 00:00:00,601318.SS,2025-01-13 00:00:00,True,51.47,2025-01-13 00:00:00,2025-01-22 00:00:00,2025-02-05 00:00:00,2025-02-06 00:00:00,,,,,,,,,,,4,,CANCEL_BY_OPPOSITE_SETUP,False,,,,,,,,,,,
-2025-04-23 00:00:00,601318.SS,2025-04-10 00:00:00,False,49.82,,,,,,,,,,,,,,,0,,CANCEL_BY_OPPOSITE_SETUP,False,,,,,,,,,,,
-2025-10-24 00:00:00,601318.SS,2025-09-08 00:00:00,True,60.15,2025-09-15 00:00:00,2025-09-16 00:00:00,2025-09-17 00:00:00,2025-09-18 00:00:00,2025-09-19 00:00:00,,,,,,,,,,5,,CANCEL_BY_OPPOSITE_SETUP,False,,,,,,,,,,,
