@@ -573,4 +573,4 @@ $$
 
 ## 致谢
 
-2022年12月1日，ChatGPT横空出世，感谢大语言模型（Large Language Models, LLMs）。
+感谢xxx
