@@ -33,6 +33,7 @@
 """
 
 import json
+from datetime import datetime
 # 注意：PTrade 禁止 import os / import sys。所有文件/目录操作必须通过
 # 内置 open()、PTrade 注入的 create_dir / get_research_path 完成。
 
@@ -76,6 +77,7 @@ _REQUIRED_CONFIG_KEYS = {
         "enabled", "buy_fraction_of_portfolio", "min_trade_value", "min_cash_for_buy",
         "take_profit_on_sell_countdown", "stop_loss_enabled", "profit_target_r_multiple",
         "stop_loss_range_multiple", "require_perfect_setup_for_buy",
+        "max_holding_days_enabled", "max_holding_days",
     ),
     "log":         ("level",),
 }
@@ -1507,6 +1509,7 @@ SELL_REASON_STOP_LOSS = "STOP_LOSS"
 SELL_REASON_PROFIT_TARGET = "PROFIT_TARGET"
 SELL_REASON_TREND_REVERSAL = "TREND_REVERSAL"
 SELL_REASON_EXTERNAL_ABORT = "EXTERNAL_ABORT"
+SELL_REASON_MAX_HOLDING_DAYS = "MAX_HOLDING_DAYS"
 DIVIDEND_TAX_RATE = 0.20
 
 
@@ -1533,6 +1536,8 @@ class TradeExecutor:
         self.profit_target_r_multiple = float(cfg_trade.get("profit_target_r_multiple", 1.5))
         self.stop_loss_range_multiple = float(cfg_trade.get("stop_loss_range_multiple", 1.0))
         self.require_perfect_setup_for_buy = bool(cfg_trade.get("require_perfect_setup_for_buy", False))
+        self.max_holding_days_enabled = bool(cfg_trade.get("max_holding_days_enabled", True))
+        self.max_holding_days = int(cfg_trade.get("max_holding_days", 400))
         self.logger = logger
         self.trade_recorder = trade_recorder
         self.metadata_recorder = metadata_recorder
@@ -1585,6 +1590,14 @@ class TradeExecutor:
 
             stop_loss = self._safe_float(trade.get("stop_loss_price", 0.0))
             take_profit = self._safe_float(trade.get("take_profit_price", 0.0))
+            holding_days = self._holding_days(trade, bar_dt)
+
+            if self._should_exit_by_holding_days(holding_days):
+                self._sell_open_trade(
+                    context, security, trade, completed_bar.close,
+                    completed_bar.datetime, SELL_REASON_MAX_HOLDING_DAYS,
+                )
+                continue
 
             # 同一根 K 线同时触发时，保守按先止损处理。
             if self.stop_loss_enabled and stop_loss > 0 and completed_bar.low <= stop_loss:
@@ -1740,6 +1753,10 @@ class TradeExecutor:
             if price <= 0:
                 continue
             for trade in list(self._open_trade_list(security)):
+                holding_days = self._holding_days(trade, self._current_dt(context))
+                if self._should_exit_by_holding_days(holding_days):
+                    self._submit_sell_order(context, security, trade, price, SELL_REASON_MAX_HOLDING_DAYS)
+                    continue
                 if self.stop_loss_enabled and price <= self._safe_float(trade.get("stop_loss_price", 0.0)):
                     self._submit_sell_order(context, security, trade, price, SELL_REASON_STOP_LOSS)
                     continue
@@ -2139,6 +2156,21 @@ class TradeExecutor:
             return int(executed)
         return int(fallback_qty)
 
+    def _should_exit_by_holding_days(self, holding_days):
+        return (
+            self.max_holding_days_enabled
+            and self.max_holding_days > 0
+            and holding_days is not None
+            and holding_days >= self.max_holding_days
+        )
+
+    def _holding_days(self, trade, current_dt):
+        buy_dt = self._parse_dt(trade.get("buy_date"))
+        cur_dt = self._parse_dt(current_dt)
+        if buy_dt is None or cur_dt is None:
+            return None
+        return max(0, (cur_dt.date() - buy_dt.date()).days)
+
     def _get_bonus_ps(self, security, date_key):
         row = self._get_exrights_row(security, date_key)
         if row is None:
@@ -2201,6 +2233,28 @@ class TradeExecutor:
         text = _format_dt(value, DATE_FMT) if not isinstance(value, str) else value
         digits = "".join([c for c in str(text) if c.isdigit()])
         return digits[:8] if len(digits) >= 8 else ""
+
+    @staticmethod
+    def _parse_dt(value):
+        if value is None:
+            return None
+        if hasattr(value, "date"):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        for fmt in (DATETIME_FMT, DATE_FMT, "%Y%m%d"):
+            try:
+                if fmt == DATETIME_FMT:
+                    candidate = text[:19]
+                elif fmt == DATE_FMT:
+                    candidate = text[:10]
+                else:
+                    candidate = "".join([c for c in text if c.isdigit()])[:8]
+                return datetime.strptime(candidate, fmt)
+            except Exception:
+                continue
+        return None
 
     # ----- Helpers -----
     def _portfolio_snapshot(self, context):

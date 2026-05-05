@@ -5063,7 +5063,9 @@
         "stop_loss_enabled": true,
         "stop_loss_range_multiple": 1.0,
         "profit_target_r_multiple": 1.5,
-        "require_perfect_setup_for_buy": false
+        "require_perfect_setup_for_buy": false,
+        "max_holding_days_enabled": true,
+        "max_holding_days": 400
     },
 
     "log": {
