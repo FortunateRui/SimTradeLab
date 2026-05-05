@@ -32,7 +32,7 @@ if __name__ == '__main__':
     # strategy_name='5mv',
     start_date='2016-01-01',
     end_date='2026-01-01',
-    initial_capital=1000000.0,  # 初始资金
+    initial_capital=10000000.0,  # 初始资金
     frequency='1d',       # '1d' 日线回测（默认），'1m' 分钟回测
     benchmark_code='000300.SS',  # 基准指数（默认沪深300）
     enable_logging=True,  # 生成 .log 日志文件（默认开启）

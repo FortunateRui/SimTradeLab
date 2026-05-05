@@ -5056,13 +5056,13 @@
 
     "trade": {
         "enabled": true,
-        "buy_fraction_of_portfolio": 0.01,
+        "buy_fraction_of_portfolio": 0.001,
         "min_trade_value": 1000,
         "min_cash_for_buy": 1000,
         "take_profit_on_sell_countdown": true,
         "stop_loss_enabled": true,
         "stop_loss_range_multiple": 1.0,
-        "profit_target_r_multiple": 1.5,
+        "profit_target_r_multiple": 1.0,
         "require_perfect_setup_for_buy": false,
         "max_holding_days_enabled": true,
         "max_holding_days": 400
