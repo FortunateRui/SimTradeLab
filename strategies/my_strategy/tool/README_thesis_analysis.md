@@ -22,7 +22,7 @@
 打开 `thesis_analysis_tool.py`，在文件开头修改：
 
 ```python
-TARGET_RUN_FOLDER = "../reacher_path/2021-01-01"
+TARGET_RUN_FOLDER = "../reacher_path/2016-01-01"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 INITIAL_CAPITAL = 1_000_000.0
 EVENT_WINDOWS = [5, 20, 60, 120]

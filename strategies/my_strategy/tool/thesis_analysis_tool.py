@@ -22,14 +22,14 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 # Config
 # =============================================================================
 
-TARGET_RUN_FOLDER = "../reacher_path/2021-01-01"
+TARGET_RUN_FOLDER = "../reacher_path/2016-01-01"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 
 INITIAL_CAPITAL = 1_000_000.0
 TRADING_DAYS_PER_YEAR = 252.0
 EVENT_WINDOWS = [5, 20, 60, 120]
 BOOTSTRAP_ENABLED = False
-SINGLE_STOCK_EVENT_MIN_COUNT = 20
+SINGLE_STOCK_EVENT_MIN_COUNT = 120
 SINGLE_STOCK_TRADE_MIN_COUNT = 10
 
 
