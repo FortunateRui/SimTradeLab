@@ -1421,7 +1421,7 @@ class TradeRecordRecorder:
         "countdown_completed_count", "countdown_is_perfect", "countdown_status",
         "bought", "buy_reject_reason", "buy_quantity", "buy_price", "buy_date",
         "entry_value", "stop_loss_price", "take_profit_price",
-        "sell_price", "sell_date", "sell_reason", "pnl",
+        "sell_price", "sell_date", "sell_reason", "price_pnl", "dividend_income", "pnl",
     ]
 
     def __init__(self, output_dir_abs, logger, enabled=True):
@@ -1507,6 +1507,7 @@ SELL_REASON_STOP_LOSS = "STOP_LOSS"
 SELL_REASON_PROFIT_TARGET = "PROFIT_TARGET"
 SELL_REASON_TREND_REVERSAL = "TREND_REVERSAL"
 SELL_REASON_EXTERNAL_ABORT = "EXTERNAL_ABORT"
+DIVIDEND_TAX_RATE = 0.20
 
 
 class TradeExecutor:
@@ -1518,7 +1519,7 @@ class TradeExecutor:
       * 若 take_profit_on_sell_countdown=true，则出现 SELL_COUNTDOWN_COMPLETE 且仓位盈利时卖出；
       * 买入后设置 stop_loss_price 与 take_profit_price；
       * 实盘环境用 on_trade_response 确认买入成交后建立风控仓位，tick_data 中追踪止盈止损；
-      * 回测环境降级为：order_value 返回订单后按当前持仓快照近似确认成交，
+      * 回测环境降级为：order_value 返回订单后按下单前后持仓差额确认成交，
         并在后续 handle_data 的上一根已完成 K 线上用 high/low 判断止盈止损。
     """
 
@@ -1540,6 +1541,8 @@ class TradeExecutor:
         self.open_trades = {}
         self.pending_buy_orders = {}
         self.pending_sell_orders = {}
+        self._processed_dividend_keys = set()
+        self._processed_share_adjustment_keys = set()
         self._next_trade_id = 1
         self._last_portfolio_snapshot = None
 
@@ -1593,11 +1596,146 @@ class TradeExecutor:
 
             trade["last_checked_bar_dt"] = bar_dt
 
+    def accrue_dividends(self, security, dt_text):
+        """把当天现金分红按逐笔未平仓数量累计到 open trades。"""
+        trades = self._open_trade_list(security)
+        if not trades:
+            return
+        date_key = self._date_key(dt_text)
+        if not date_key:
+            return
+        processed_key = "{}|{}".format(security, date_key)
+        if processed_key in self._processed_dividend_keys:
+            return
+        bonus_ps = self._get_bonus_ps(security, date_key)
+        self._processed_dividend_keys.add(processed_key)
+        if bonus_ps <= 0:
+            return
+
+        after_tax_bonus = bonus_ps * (1.0 - DIVIDEND_TAX_RATE)
+        total_income = 0.0
+        for trade in trades:
+            qty = self._safe_float(trade.get("buy_quantity"))
+            if qty <= 0:
+                continue
+            income = qty * after_tax_bonus
+            trade["dividend_income"] = round(self._safe_float(trade.get("dividend_income")) + income, 2)
+            total_income += income
+        if total_income > 0:
+            self.logger.info(
+                "现金分红已计入逐笔交易",
+                security=security,
+                date=date_key,
+                bonus_ps=round(bonus_ps, 6),
+                after_tax_bonus=round(after_tax_bonus, 6),
+                income=round(total_income, 2),
+            )
+
+    def reconcile_position_adjustments(self, context, security, dt_text):
+        """
+        同步除权送股后的逐笔交易数量和风控价格。
+
+        优先使用 get_stock_exrights 的 allotted_ps 明确处理送股/转增；
+        账户真实持仓数量只作为兜底校验，避免接口缺失或字段异常时残留仓位。
+        """
+        trades = self._open_trade_list(security)
+        if not trades:
+            return
+        if self._has_pending_sell_for_security(security):
+            return
+
+        date_key = self._date_key(dt_text)
+        if date_key:
+            processed_key = "{}|{}".format(security, date_key)
+            if processed_key not in self._processed_share_adjustment_keys:
+                ratio = self._get_share_adjustment_ratio(security, date_key)
+                self._processed_share_adjustment_keys.add(processed_key)
+                if ratio > 1.0:
+                    self._apply_position_adjustment(
+                        context=context,
+                        security=security,
+                        dt_text=dt_text,
+                        ratio=ratio,
+                        reason="EXRIGHTS_ALLOTTED_PS",
+                    )
+
+        # 兜底：若账户股数仍显著大于内部逐笔仓位，说明还有未显式处理的分股类调整。
+        account_qty, _, _ = self._get_position_detail(security)
+        internal_qty = self._open_quantity(security)
+        if account_qty <= 0 or internal_qty <= 0:
+            return
+        diff = account_qty - internal_qty
+        if diff <= max(1.0, internal_qty * 0.001):
+            return
+        ratio = account_qty / internal_qty
+        if ratio <= 1.0:
+            return
+        self._apply_position_adjustment(
+            context=context,
+            security=security,
+            dt_text=dt_text,
+            ratio=ratio,
+            reason="ACCOUNT_QTY_RECONCILE",
+            account_qty=account_qty,
+            before_internal_qty=internal_qty,
+            warning=True,
+        )
+
+    def _apply_position_adjustment(
+        self, context, security, dt_text, ratio, reason, account_qty="", before_internal_qty="", warning=False,
+    ):
+        trades = self._open_trade_list(security)
+        if not trades or ratio <= 1.0:
+            return
+        self._last_portfolio_snapshot = self._portfolio_snapshot(context)
+        adjusted_rows = []
+        for trade in trades:
+            before_qty = self._safe_float(trade.get("buy_quantity"))
+            if before_qty <= 0:
+                continue
+            before_price = self._safe_float(trade.get("buy_price"))
+            before_stop = self._safe_float(trade.get("stop_loss_price"))
+            before_take = self._safe_float(trade.get("take_profit_price"))
+            before_entry = self._safe_float(trade.get("entry_value"))
+
+            after_qty = before_qty * ratio
+            after_price = before_price / ratio if before_price > 0 else before_price
+            after_stop = before_stop / ratio if before_stop > 0 else before_stop
+            after_take = before_take / ratio if before_take > 0 else before_take
+            entry_value = before_entry if before_entry > 0 else after_qty * after_price
+
+            trade["buy_quantity"] = int(round(after_qty))
+            trade["buy_price"] = round(after_price, 4) if after_price > 0 else trade.get("buy_price", "")
+            trade["entry_value"] = round(entry_value, 2)
+            if before_stop > 0:
+                trade["stop_loss_price"] = round(after_stop, 4)
+            if before_take > 0:
+                trade["take_profit_price"] = round(after_take, 4)
+            self._record_position_snapshot("ADJUST", security, trade, dt_text, sell_price="", sell_reason="", pnl="")
+            adjusted_rows.append((trade.get("_trade_id"), before_qty, trade["buy_quantity"]))
+
+        if adjusted_rows:
+            log_kwargs = {
+                "security": security,
+                "reason": reason,
+                "ratio": round(ratio, 6),
+                "lots": len(adjusted_rows),
+            }
+            if account_qty != "":
+                log_kwargs["account_qty"] = round(account_qty, 4)
+            if before_internal_qty != "":
+                log_kwargs["before_internal_qty"] = round(before_internal_qty, 4)
+            if warning:
+                self.logger.warning("通过账户持仓差额兜底同步逐笔仓位，请检查 get_stock_exrights 是否漏掉分股事件", **log_kwargs)
+            else:
+                self.logger.info("同步除权送股后的逐笔仓位", **log_kwargs)
+
     def check_tick_exits(self, context, tick_data_obj):
         """实盘 tick_data 中追踪止盈止损。回测环境不执行。"""
         if not self._is_live_trade():
             return
         for security in list(self.open_trades.keys()):
+            self.reconcile_position_adjustments(context, security, _format_dt(self._current_dt(context)))
             price = self._extract_tick_price(tick_data_obj, security)
             if price <= 0:
                 continue
@@ -1639,8 +1777,10 @@ class TradeExecutor:
             security = pending["security"]
             if price <= 0:
                 price = self._safe_float(pending.get("fallback_price"))
+            if qty <= 0:
+                qty = self._safe_float(pending.get("fallback_qty"))
             self._last_portfolio_snapshot = self._portfolio_snapshot(context)
-            self._finalize_sell(security, pending["trade"], price, trade_dt or pending["sell_date"], pending["sell_reason"])
+            self._finalize_sell(security, pending["trade"], price, trade_dt or pending["sell_date"], pending["sell_reason"], qty)
 
     # ----- Buy side -----
     def _try_buy_from_signal(self, context, security, ev):
@@ -1677,6 +1817,7 @@ class TradeExecutor:
 
         decision_dt = _format_dt(self._current_dt(context))
         fallback_price = self._safe_float(ev.get("bar_close"))
+        before_qty, _, _ = self._get_position_detail(security) if not self._is_live_trade() else (0.0, 0.0, 0.0)
         try:
             order_id = order_value(security, actual_value)  # noqa: F821 - PTrade 注入
         except Exception as e:
@@ -1696,11 +1837,10 @@ class TradeExecutor:
             self.logger.info("买入委托已提交，等待成交回报", security=security, order_id=order_id, value=round(actual_value, 2))
             return
 
-        # 回测降级：order_value 返回订单号后，按本次委托金额估算本笔成交数量。
-        # 不使用总持仓数量，避免同一标的多次买入时把历史仓位重复计入本笔记录。
-        _, _, entry_price = self._get_position_detail(security)
-        price_for_qty = entry_price if entry_price > 0 else fallback_price
-        qty = int(actual_value / price_for_qty / 100) * 100 if price_for_qty > 0 else 0
+        # 回测降级：优先用下单前后持仓差额确认本笔真实成交数量；
+        # 若兼容层无法读取变化，再按本次委托金额兜底估算。
+        after_qty, _, entry_price = self._get_position_detail(security)
+        qty = self._infer_backtest_buy_quantity(security, actual_value, fallback_price, before_qty, after_qty)
         if entry_price <= 0:
             entry_price = fallback_price
         self._open_trade_from_fill(security, ev, entry_price, qty, decision_dt)
@@ -1726,6 +1866,8 @@ class TradeExecutor:
             "sell_price": "",
             "sell_date": "",
             "sell_reason": "",
+            "price_pnl": "",
+            "dividend_income": 0.0,
             "pnl": "",
         })
         self._next_trade_id += 1
@@ -1763,14 +1905,17 @@ class TradeExecutor:
     def _submit_sell_order(self, context, security, trade, fallback_price, sell_reason):
         if not self._trade_is_open(security, trade) or self._has_pending_sell_for_trade(trade):
             return
-        pos_value = self._trade_value(trade, fallback_price)
+        sell_qty = self._sell_quantity(trade)
+        if sell_qty <= 0:
+            self.logger.info("卖出委托未提交：该笔仓位数量无效", security=security, trade_id=trade.get("_trade_id"), reason=sell_reason)
+            return
         try:
-            order_id = order_value(security, -pos_value)  # noqa: F821 - PTrade 注入
+            order_id = order(security, -sell_qty)  # noqa: F821 - PTrade 注入
         except Exception as e:
-            self.logger.error("卖出 order_value 调用失败", security=security, err=e, value=-pos_value, reason=sell_reason)
+            self.logger.error("卖出 order 调用失败", security=security, err=e, quantity=-sell_qty, reason=sell_reason)
             return
         if not order_id:
-            self.logger.info("卖出委托未提交", security=security, value=round(pos_value, 2), reason=sell_reason)
+            self.logger.info("卖出委托未提交", security=security, quantity=sell_qty, reason=sell_reason)
             return
         self.pending_sell_orders[str(order_id)] = {
             "security": security,
@@ -1778,6 +1923,7 @@ class TradeExecutor:
             "sell_reason": sell_reason,
             "sell_date": _format_dt(self._current_dt(context)),
             "fallback_price": fallback_price,
+            "fallback_qty": sell_qty,
         }
 
     def _sell_open_trade(self, context, security, trade, sell_price, sell_date, sell_reason):
@@ -1786,36 +1932,62 @@ class TradeExecutor:
         if self._is_live_trade():
             self._submit_sell_order(context, security, trade, sell_price, sell_reason)
             return
-        pos_value = self._trade_value(trade, sell_price)
+        sell_qty = self._sell_quantity(trade)
+        if sell_qty <= 0:
+            self.logger.info("卖出委托未提交：该笔仓位数量无效", security=security, trade_id=trade.get("_trade_id"), reason=sell_reason)
+            return
+        before_qty, _, _ = self._get_position_detail(security)
         try:
-            order_id = order_value(security, -pos_value)  # noqa: F821 - PTrade 注入
+            order_id = order(security, -sell_qty)  # noqa: F821 - PTrade 注入
         except Exception as e:
-            self.logger.error("卖出 order_value 调用失败", security=security, err=e, value=-pos_value, reason=sell_reason)
+            self.logger.error("卖出 order 调用失败", security=security, err=e, quantity=-sell_qty, reason=sell_reason)
             return
         if not order_id:
-            self.logger.info("卖出委托未提交", security=security, value=round(pos_value, 2), reason=sell_reason)
+            self.logger.info("卖出委托未提交", security=security, quantity=sell_qty, reason=sell_reason)
             return
         self._last_portfolio_snapshot = self._portfolio_snapshot(context)
-        self._finalize_sell(security, trade, sell_price, sell_date, sell_reason)
+        executed_qty = self._infer_backtest_sell_quantity(security, sell_qty, before_qty)
+        self._finalize_sell(security, trade, sell_price, sell_date, sell_reason, executed_qty)
 
-    def _finalize_sell(self, security, trade, sell_price, sell_date, sell_reason):
+    def _finalize_sell(self, security, trade, sell_price, sell_date, sell_reason, sell_qty=None):
         if not self._trade_is_open(security, trade):
             return
-        self._remove_open_trade(security, trade)
         row = dict(trade)
         buy_price = self._safe_float(row.get("buy_price"))
-        qty = self._safe_float(row.get("buy_quantity"))
-        pnl = (sell_price - buy_price) * qty
+        original_qty = self._safe_float(row.get("buy_quantity"))
+        qty = self._safe_float(sell_qty) if sell_qty is not None else original_qty
+        if qty <= 0:
+            qty = original_qty
+        if original_qty > 0 and qty > original_qty:
+            qty = original_qty
+        price_pnl = (sell_price - buy_price) * qty
+        dividend_total = self._safe_float(trade.get("dividend_income"))
+        dividend_income = dividend_total * qty / original_qty if original_qty > 0 else 0.0
+        pnl = price_pnl + dividend_income
+        if qty < original_qty:
+            remaining_qty = original_qty - qty
+            trade["buy_quantity"] = remaining_qty
+            trade["entry_value"] = round(buy_price * remaining_qty, 2)
+            trade["dividend_income"] = round(max(0.0, dividend_total - dividend_income), 2)
+            row["buy_quantity"] = qty
+            row["entry_value"] = round(buy_price * qty, 2)
+        else:
+            self._remove_open_trade(security, trade)
         row.update({
             "datetime": sell_date,
             "sell_price": round(sell_price, 4),
             "sell_date": sell_date,
             "sell_reason": sell_reason,
+            "price_pnl": round(price_pnl, 2),
+            "dividend_income": round(dividend_income, 2),
             "pnl": round(pnl, 2),
         })
         self.trade_recorder.record(row)
         self._record_position_snapshot("CLOSE", security, row, sell_date, sell_price=sell_price, sell_reason=sell_reason, pnl=pnl)
-        self.logger.info("交易生命周期结束", security=security, sell_reason=sell_reason, pnl=round(pnl, 2))
+        if qty < original_qty:
+            self.logger.info("交易部分平仓", security=security, sell_reason=sell_reason, sell_qty=qty, remaining_qty=original_qty - qty, pnl=round(pnl, 2))
+        else:
+            self.logger.info("交易生命周期结束", security=security, sell_reason=sell_reason, sell_qty=qty, pnl=round(pnl, 2))
 
     # ----- Records -----
     def _record_terminal(self, ev, bought=False, buy_reject_reason="", countdown_status=None):
@@ -1836,6 +2008,8 @@ class TradeExecutor:
             "sell_price": "",
             "sell_date": "",
             "sell_reason": "",
+            "price_pnl": "",
+            "dividend_income": "",
             "pnl": "",
         })
         self.trade_recorder.record(row)
@@ -1928,12 +2102,105 @@ class TradeExecutor:
                 return True
         return False
 
-    def _trade_value(self, trade, fallback_price):
+    def _has_pending_sell_for_security(self, security):
+        for pending in self.pending_sell_orders.values():
+            if pending.get("security") == security:
+                return True
+        return False
+
+    def _open_quantity(self, security):
+        total = 0.0
+        for trade in self._open_trade_list(security):
+            total += self._safe_float(trade.get("buy_quantity"))
+        return total
+
+    def _sell_quantity(self, trade):
         qty = self._safe_float(trade.get("buy_quantity"))
-        price = self._safe_float(fallback_price)
-        if qty > 0 and price > 0:
-            return qty * price
-        return self._safe_float(trade.get("buy_price")) * qty
+        if qty <= 0:
+            return 0
+        return int(qty)
+
+    def _infer_backtest_buy_quantity(self, security, actual_value, fallback_price, before_qty, after_qty):
+        executed = self._safe_float(after_qty) - self._safe_float(before_qty)
+        if executed > 0:
+            return int(executed)
+        price_for_qty = fallback_price if fallback_price > 0 else 0.0
+        qty = int(actual_value / price_for_qty / 100) * 100 if price_for_qty > 0 else 0
+        if qty <= 0:
+            self.logger.info("买入成交数量无法确认", security=security, value=round(actual_value, 2))
+        return qty
+
+    def _infer_backtest_sell_quantity(self, security, fallback_qty, before_qty):
+        # SimTradeLab/PTrade 回测通常同步更新持仓；若能读到下单前后变化，
+        # 以后续成交后的真实持仓差额为准，避免整手/零股调整造成记录漂移。
+        after_qty, _, _ = self._get_position_detail(security)
+        executed = self._safe_float(before_qty) - self._safe_float(after_qty)
+        if executed > 0:
+            return int(executed)
+        return int(fallback_qty)
+
+    def _get_bonus_ps(self, security, date_key):
+        row = self._get_exrights_row(security, date_key)
+        if row is None:
+            return 0.0
+        return self._read_row_float(row, ["bonus_ps", "bonus", "cash_bonus", "dividend", "dividend_ps"])
+
+    def _get_share_adjustment_ratio(self, security, date_key):
+        row = self._get_exrights_row(security, date_key)
+        if row is None:
+            return 1.0
+        allotted_ps = self._read_row_float(row, ["allotted_ps", "allotted", "stock_bonus", "bonus_share"])
+        if allotted_ps <= 0:
+            return 1.0
+        return 1.0 + allotted_ps
+
+    def _get_exrights_row(self, security, date_key):
+        try:
+            exrights = get_stock_exrights(security)  # noqa: F821 - PTrade 注入
+        except Exception as e:
+            self.logger.debug("读取除权除息数据失败", security=security, date=date_key, err=e)
+            return None
+        return self._pick_exrights_row(exrights, date_key)
+
+    def _pick_exrights_row(self, exrights, date_key):
+        if exrights is None:
+            return None
+        try:
+            rows_iter = exrights.iterrows()
+        except Exception:
+            rows_iter = None
+        if rows_iter is not None:
+            for idx, row in rows_iter:
+                if self._date_key(idx) == date_key:
+                    return row
+            return None
+        try:
+            if self._date_key(exrights.get("date", "")) == date_key:
+                return exrights
+        except Exception:
+            return None
+        return None
+
+    def _read_row_float(self, row, names):
+        for name in names:
+            try:
+                if isinstance(row, dict) and name in row:
+                    return self._safe_float(row.get(name))
+                if hasattr(row, "get"):
+                    value = row.get(name)
+                    if value is not None:
+                        return self._safe_float(value)
+                if hasattr(row, name):
+                    return self._safe_float(getattr(row, name))
+            except Exception:
+                continue
+        return 0.0
+
+    @staticmethod
+    def _date_key(value):
+        text = _format_dt(value, DATE_FMT) if not isinstance(value, str) else value
+        digits = "".join([c for c in str(text) if c.isdigit()])
+        return digits[:8] if len(digits) >= 8 else ""
 
     # ----- Helpers -----
     def _portfolio_snapshot(self, context):
@@ -2375,6 +2642,15 @@ def handle_data(context, data):
 
         # 回测降级：没有 tick_data / on_trade_response 时，用上一根已完成 K 线的 high/low
         # 追踪已有仓位的止盈止损。实盘环境中该逻辑由 tick_data 负责。
+        g.trade_executor.accrue_dividends(
+            security=security,
+            dt_text=_format_dt(g.current_dt),
+        )
+        g.trade_executor.reconcile_position_adjustments(
+            context=context,
+            security=security,
+            dt_text=_format_dt(g.current_dt),
+        )
         g.trade_executor.check_backtest_exits(context, security, bars[-1])
 
         # (3) 信号层：每日全量重算
