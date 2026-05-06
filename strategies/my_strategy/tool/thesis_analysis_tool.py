@@ -22,7 +22,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 # Config
 # =============================================================================
 
-TARGET_RUN_FOLDER = "../reacher_path/2016-01-01"
+TARGET_RUN_FOLDER = "../research_path/2016-01-01"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 
 INITIAL_CAPITAL = 1_000_000.0

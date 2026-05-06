@@ -22,7 +22,7 @@
 打开 `thesis_analysis_tool.py`，在文件开头修改：
 
 ```python
-TARGET_RUN_FOLDER = "../reacher_path/2016-01-01"
+TARGET_RUN_FOLDER = "../research_path/2016-01-01"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 INITIAL_CAPITAL = 1_000_000.0
 EVENT_WINDOWS = [5, 20, 60, 120]
@@ -33,13 +33,13 @@ SINGLE_STOCK_TRADE_MIN_COUNT = 10
 也可以通过命令行覆盖运行目录：
 
 ```bash
-python strategies/my_strategy/tool/thesis_analysis_tool.py ../reacher_path/2021-01-01
+python strategies/my_strategy/tool/thesis_analysis_tool.py ../research_path/2021-01-01
 ```
 
 在项目虚拟环境中运行：
 
 ```bash
-poetry run python strategies/my_strategy/tool/thesis_analysis_tool.py ../reacher_path/2021-01-01
+poetry run python strategies/my_strategy/tool/thesis_analysis_tool.py ../research_path/2021-01-01
 ```
 
 ## 输出文件
