@@ -78,6 +78,6 @@ data*/
 strategies/*/stats/*.csv
 .python-version
 /strategies/my_strategy/output
-/strategies/my_strategy/reacher_path
+/strategies/my_strategy/research_path
 /strategies/my_strategy/stats
 /skills
