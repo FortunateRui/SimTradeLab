@@ -25,7 +25,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 TARGET_RUN_FOLDER = "../research_path/2016-01-01"
 OUTPUT_FOLDER_NAME = "thesis_analysis"
 
-INITIAL_CAPITAL = 1_000_000.0
+INITIAL_CAPITAL = 10_000_000.0
 TRADING_DAYS_PER_YEAR = 252.0
 EVENT_WINDOWS = [5, 20, 60, 120]
 BOOTSTRAP_ENABLED = False
