@@ -49,8 +49,8 @@ CONFIG_REL_PATH = "TD913_xiongrui/config.json"
 # 本地 SimTradeLab 回测兼容路径。PTrade 实盘/云回测仍优先使用 CONFIG_REL_PATH；
 # 如果研究目录下找不到配置，再按这些路径依次尝试。
 LOCAL_CONFIG_FALLBACK_PATHS = [
-    "strategies/my_strategy/reacher_path/config.json",
-    "./strategies/my_strategy/reacher_path/config.json",
+    "strategies/my_strategy/research_path/config.json",
+    "./strategies/my_strategy/research_path/config.json",
     "config.json",
 ]
 
@@ -70,7 +70,7 @@ _REQUIRED_CONFIG_SECTIONS = (
 _REQUIRED_CONFIG_KEYS = {
     "universe":    ("securities", "benchmark"),
     "data":        ("frequency", "fq", "lookback_count", "min_required_bars"),
-    "backtest":    ("slippage", "limit_mode"),
+    "backtest":    ("slippage", "limit_mode", "commission_ratio", "min_commission"),
     "setup":       ("require_perfect_for_signal",),
     "countdown":   ("enabled", "tdst_cancel_rule"),
     "trade":       (
@@ -1311,9 +1311,9 @@ class MetadataRecorder:
     ]
     POSITION_HEADER_FIELDS = [
         "datetime", "event", "security", "trade_id",
-        "open_trade_count", "buy_quantity", "buy_price", "entry_value",
-        "stop_loss_price", "take_profit_price",
-        "sell_price", "sell_reason", "pnl",
+        "open_trade_count", "buy_order_id", "buy_quantity", "buy_price",
+        "buy_commission", "entry_value", "stop_loss_price", "take_profit_price",
+        "sell_order_id", "sell_price", "sell_commission", "sell_reason", "pnl",
         "total_value", "available_cash",
     ]
     OUTCOME_HEADER_FIELDS = [
@@ -1421,9 +1421,11 @@ class TradeRecordRecorder:
         "count_6_at", "count_7_at", "count_8_at", "count_8_close",
         "count_9_at", "count_10_at", "count_11_at", "count_12_at", "count_13_at",
         "countdown_completed_count", "countdown_is_perfect", "countdown_status",
-        "bought", "buy_reject_reason", "buy_quantity", "buy_price", "buy_date",
+        "bought", "buy_reject_reason",
+        "buy_order_id", "buy_quantity", "buy_price", "buy_commission", "buy_date",
         "entry_value", "stop_loss_price", "take_profit_price",
-        "sell_price", "sell_date", "sell_reason", "price_pnl", "dividend_income", "pnl",
+        "sell_order_id", "sell_price", "sell_commission", "sell_date", "sell_reason",
+        "price_pnl", "dividend_income", "pnl",
     ]
 
     def __init__(self, output_dir_abs, logger, enabled=True):
@@ -1492,54 +1494,150 @@ def _format_dt(dt, fmt=DATETIME_FMT):
 # =============================================================================
 # [7] 交易执行层
 # =============================================================================
-
-COUNTDOWN_STATUS_NORMAL = "NORMAL"
-COUNTDOWN_STATUS_CANCEL_TDST_PREFIX = "CANCEL_BY_TDST_RULE_"
-COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP = "CANCEL_BY_OPPOSITE_SETUP"
-COUNTDOWN_STATUS_CANCEL_SAME_SETUP = "CANCEL_BY_SAME_SETUP"
-
-BUY_REJECT_TRADE_DISABLED = "TRADE_DISABLED"
-BUY_REJECT_NON_PERFECT_SETUP = "NON_PERFECT_SETUP"
-BUY_REJECT_INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
-BUY_REJECT_MIN_TRADE_VALUE = "MIN_TRADE_VALUE"
-BUY_REJECT_ORDER_REJECTED = "ORDER_REJECTED"
-BUY_REJECT_ORDER_ERROR = "ORDER_ERROR"
+#
+# 本层只负责"按意图下单 → 用 PTrade 真实成交回报回填记录 → 跟踪止盈止损 / 持仓事件"，
+# **完全不知道 TD 9-13 / Setup / Countdown 等信号语义**。
+#
+# 上层（TDStrategyAdapter）通过 BuyIntent / SellIntent 与本层通讯，并以
+# TradeExecutorCallbacks 接收成交、拒单、平仓回调，由它负责把这些事件翻译成
+# trade.csv 中的完整 TD 生命周期记录。
+# =============================================================================
 
 SELL_REASON_STOP_LOSS = "STOP_LOSS"
 SELL_REASON_PROFIT_TARGET = "PROFIT_TARGET"
 SELL_REASON_TREND_REVERSAL = "TREND_REVERSAL"
 SELL_REASON_EXTERNAL_ABORT = "EXTERNAL_ABORT"
 SELL_REASON_MAX_HOLDING_DAYS = "MAX_HOLDING_DAYS"
+
+# 通用买入拒绝原因（与具体策略无关，由交易层主动给出）。策略层可以在
+# 自己的预检中再加更多原因（例如 NON_PERFECT_SETUP 等）。
+BUY_REJECT_TRADE_DISABLED = "TRADE_DISABLED"
+BUY_REJECT_INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
+BUY_REJECT_MIN_TRADE_VALUE = "MIN_TRADE_VALUE"
+BUY_REJECT_ORDER_REJECTED = "ORDER_REJECTED"
+BUY_REJECT_ORDER_ERROR = "ORDER_ERROR"
+BUY_REJECT_TIMEOUT = "TIMEOUT"
+
+# 卖出拒绝/异常原因
+SELL_REJECT_TIMEOUT = "TIMEOUT"
+SELL_REJECT_TERMINAL_NO_FILL = "TERMINAL_NO_FILL"
+SELL_REJECT_INVALID_QTY = "INVALID_QTY"
+SELL_REJECT_ORDER_REJECTED = "ORDER_REJECTED"
+SELL_REJECT_ORDER_ERROR = "ORDER_ERROR"
+
 DIVIDEND_TAX_RATE = 0.20
+
+# PTrade 引擎硬编码的两类附加费率（见 set_commission 文档）：经手费按所有交易计、
+# 印花税仅卖出时计。策略自算手续费时复用同一份常量，使 trade.csv 中的
+# `*_commission` 与 PTrade 引擎实际扣款保持一致量级。
+PTRADE_TRANSFER_FEE_RATIO = 0.0000487
+PTRADE_STAMP_TAX_RATIO = 0.001
+
+
+class BuyIntent:
+    """策略层 → 交易层的买入意图。`metadata` 是不透明字典，交易层不解析。"""
+    __slots__ = ("security", "target_value", "decision_dt", "fallback_price", "metadata")
+
+    def __init__(self, security, target_value, decision_dt, fallback_price, metadata=None):
+        self.security = security
+        self.target_value = float(target_value)
+        self.decision_dt = decision_dt
+        self.fallback_price = float(fallback_price) if fallback_price else 0.0
+        self.metadata = metadata or {}
+
+
+class SellIntent:
+    """策略层 → 交易层的卖出意图。`trade` 必须是交易层维护的某条 open_trade 引用。"""
+    __slots__ = ("security", "trade", "sell_reason", "fallback_price", "metadata")
+
+    def __init__(self, security, trade, sell_reason, fallback_price, metadata=None):
+        self.security = security
+        self.trade = trade
+        self.sell_reason = sell_reason
+        self.fallback_price = float(fallback_price) if fallback_price else 0.0
+        self.metadata = metadata or {}
+
+
+class FillInfo:
+    """交易层 → 策略层：一笔成交的真实回报。"""
+    __slots__ = ("order_id", "security", "side", "quantity", "price", "commission", "fill_dt")
+
+    def __init__(self, order_id, security, side, quantity, price, commission, fill_dt):
+        self.order_id = str(order_id) if order_id else ""
+        self.security = security
+        self.side = side  # "buy" or "sell"
+        self.quantity = int(quantity)
+        self.price = float(price) if price else 0.0
+        self.commission = float(commission) if commission else 0.0
+        self.fill_dt = fill_dt
+
+
+class TradeExecutorCallbacks:
+    """
+    策略层实现该接口监听交易层事件。默认实现全部为 no-op，
+    交易层不依赖任何返回值——回调里抛异常会被交易层日志记录但不会中断流程。
+    """
+    def on_buy_rejected(self, intent, reason): pass
+    def on_buy_filled(self, intent, trade, fill): pass
+    def on_sell_rejected(self, intent, reason): pass
+    def on_sell_filled(self, intent, trade, fill, pnl_breakdown): pass
+    def on_position_adjusted(self, security, trade, dt_text, ratio, reason): pass
 
 
 class TradeExecutor:
     """
-    当前交易策略：
-      * 默认只根据 BUY_COUNTDOWN_COMPLETE 买入；
-      * 每次买入总资产 buy_fraction_of_portfolio；
-      * SELL_COUNTDOWN_COMPLETE 默认只保留信号，不用于卖出；
-      * 若 take_profit_on_sell_countdown=true，则出现 SELL_COUNTDOWN_COMPLETE 且仓位盈利时卖出；
-      * 买入后设置 stop_loss_price 与 take_profit_price；
-      * 实盘环境用 on_trade_response 确认买入成交后建立风控仓位，tick_data 中追踪止盈止损；
-      * 回测环境降级为：order_value 返回订单后按下单前后持仓差额确认成交，
-        并在后续 handle_data 的上一根已完成 K 线上用 high/low 判断止盈止损。
+    通用交易执行层。职责：
+      1. 接收 BuyIntent / SellIntent；
+      2. 调用 PTrade `order_value` / `order` 提交委托并挂入 pending 队列；
+      3. 每周期通过 `reconcile_pending_orders` 用 PTrade 真实成交回报落账；
+      4. 跟踪每一笔未平仓交易的止损价 / 止盈价 / 持仓天数 / 归属分红；
+      5. 在回测中 `check_backtest_exits` 用上一根 K 线高低判断风控触发；
+         在实盘中 `check_tick_exits` 逐 tick 触发；
+      6. 处理除权送股、现金分红同步；
+      7. 通过 TradeExecutorCallbacks 把成交 / 拒单 / 平仓事件回调给策略层。
+
+    本类**不依赖任何信号定义**（不知道 TD / Setup / Countdown），所有策略相关
+    的 trade.csv 行写入工作由策略层（TDStrategyAdapter）完成。
     """
 
-    def __init__(self, cfg_trade, logger, trade_recorder=None, metadata_recorder=None):
+    def __init__(
+        self, cfg_trade, logger, callbacks=None, metadata_recorder=None,
+        commission_ratio=0.0003, min_commission=5.0,
+        transfer_fee_ratio=PTRADE_TRANSFER_FEE_RATIO,
+        stamp_tax_ratio=PTRADE_STAMP_TAX_RATIO,
+    ):
         self.enabled = bool(cfg_trade.get("enabled", True))
         self.buy_fraction = float(cfg_trade.get("buy_fraction_of_portfolio", 0.1))
         self.min_trade_value = float(cfg_trade.get("min_trade_value", 1000))
         self.min_cash_for_buy = float(cfg_trade.get("min_cash_for_buy", 1000))
-        self.take_profit_on_sell_countdown = bool(cfg_trade.get("take_profit_on_sell_countdown", False))
         self.stop_loss_enabled = bool(cfg_trade.get("stop_loss_enabled", True))
-        self.profit_target_r_multiple = float(cfg_trade.get("profit_target_r_multiple", 1.5))
-        self.stop_loss_range_multiple = float(cfg_trade.get("stop_loss_range_multiple", 1.0))
-        self.require_perfect_setup_for_buy = bool(cfg_trade.get("require_perfect_setup_for_buy", False))
         self.max_holding_days_enabled = bool(cfg_trade.get("max_holding_days_enabled", True))
         self.max_holding_days = int(cfg_trade.get("max_holding_days", 400))
+        # ----- 手续费配置（与 PTrade set_commission 共用同一份费率） -----
+        # PTrade Python API 不暴露 commission 字段，策略需要按这份配置自算，
+        # 让 trade.csv 中的 buy_commission / sell_commission 与 PTrade 引擎扣款一致。
+        # `transfer_fee_ratio`、`stamp_tax_ratio` 默认硬编码为 PTrade 文档中的固定值，
+        # 留参数主要为了离线工具或单元测试场景下能注入不同值。
+        self.commission_ratio = float(commission_ratio)
+        self.min_commission = float(min_commission)
+        self.transfer_fee_ratio = float(transfer_fee_ratio)
+        self.stamp_tax_ratio = float(stamp_tax_ratio)
+        # ----- 超时未成交订单保护 -----
+        # 同一笔订单挂在 pending 队列里 N 个自然日仍未拿到 PTrade 终态时：
+        #   1. 第一次到达 `pending_order_timeout_days` 时主动 cancel_order，
+        #      并把 timeout_cancel_attempted 标记上，下一周期 reconcile 看到
+        #      撤单后的终态会走正常的清理路径；
+        #   2. 若到达 `pending_order_force_drop_days` 仍未消化（说明撤单也没生效），
+        #      强制摘除 pending 项并触发 on_*_rejected(TIMEOUT)，避免后续止损
+        #      因为 _has_pending_sell_for_trade 而被永久阻塞。
+        # 任意一个值 <= 0 即视为关闭对应保护。
+        self.pending_order_timeout_days = int(cfg_trade.get("pending_order_timeout_days", 5))
+        self.pending_order_force_drop_days = int(cfg_trade.get(
+            "pending_order_force_drop_days",
+            max(self.pending_order_timeout_days * 2, self.pending_order_timeout_days + 1),
+        ))
         self.logger = logger
-        self.trade_recorder = trade_recorder
+        self.callbacks = callbacks or TradeExecutorCallbacks()
         self.metadata_recorder = metadata_recorder
 
         # 每个标的可同时跟踪多笔完整交易；每笔买入独立计算止损/止盈。
@@ -1551,35 +1649,28 @@ class TradeExecutor:
         self._next_trade_id = 1
         self._last_portfolio_snapshot = None
 
-    def execute_for_events(self, context, security, last_bar_events):
-        if not last_bar_events:
+    def set_callbacks(self, callbacks):
+        """运行时绑定策略层回调（initialize() 中常用：先建 executor，再建 adapter 注册）。"""
+        self.callbacks = callbacks or TradeExecutorCallbacks()
+
+    def _safe_callback(self, name, *args, **kwargs):
+        """统一的回调调用入口；任何回调异常都不会传染到交易层。"""
+        cb = getattr(self.callbacks, name, None)
+        if cb is None:
             return
-
-        for ev in last_bar_events:
-            if ev.get("category") != "COUNTDOWN":
-                continue
-            ev_type = ev.get("type", "")
-            direction = int(ev.get("direction", 0))
-
-            # Buy countdown 取消：生命周期在"计数取消"处结束，写一行。
-            if direction == 1 and ev_type == "BUY_COUNTDOWN_CANCEL":
-                self._record_terminal(ev, bought=False, buy_reject_reason="", countdown_status=self._countdown_status(ev))
-                continue
-
-            # Buy countdown 完成：尝试买入；若不能买，生命周期在"交易取消"处结束，写一行。
-            if direction == 1 and ev_type.startswith("BUY_COUNTDOWN_COMPLETE"):
-                self._try_buy_from_signal(context, security, ev)
-                continue
-
-            # Sell countdown 完成：默认不交易；配置开启时，仅盈利仓位趋势反转止盈。
-            if direction == -1 and ev_type.startswith("SELL_COUNTDOWN_COMPLETE"):
-                self._try_sell_on_sell_countdown(context, security, ev)
+        try:
+            cb(*args, **kwargs)
+        except Exception as e:
+            self.logger.error("策略层回调异常", callback=name, err=e)
 
     def check_backtest_exits(self, context, security, completed_bar):
         """
         回测降级：用上一根已完成 K 线的 high/low 判断止盈止损。
         注意：刚根据该 completed_bar 信号买入的仓位，会把 last_checked_bar_dt 初始化为
         signal datetime，因此不会在同一根历史 K 上立刻被止盈/止损。
+
+        卖出价 / 卖出时间一律以 PTrade 真实成交回报为准记录；止损 / 止盈阈值仅
+        作为触发条件，不再作为 trade.csv 中的成交价。
         """
         if self._is_live_trade() or not self._open_trade_list(security):
             return
@@ -1593,18 +1684,27 @@ class TradeExecutor:
             holding_days = self._holding_days(trade, bar_dt)
 
             if self._should_exit_by_holding_days(holding_days):
-                self._sell_open_trade(
-                    context, security, trade, completed_bar.close,
-                    completed_bar.datetime, SELL_REASON_MAX_HOLDING_DAYS,
-                )
+                self.submit_sell(context, SellIntent(
+                    security=security, trade=trade,
+                    sell_reason=SELL_REASON_MAX_HOLDING_DAYS,
+                    fallback_price=completed_bar.close,
+                ))
                 continue
 
             # 同一根 K 线同时触发时，保守按先止损处理。
             if self.stop_loss_enabled and stop_loss > 0 and completed_bar.low <= stop_loss:
-                self._sell_open_trade(context, security, trade, stop_loss, completed_bar.datetime, SELL_REASON_STOP_LOSS)
+                self.submit_sell(context, SellIntent(
+                    security=security, trade=trade,
+                    sell_reason=SELL_REASON_STOP_LOSS,
+                    fallback_price=stop_loss,
+                ))
                 continue
             if take_profit > 0 and completed_bar.high >= take_profit:
-                self._sell_open_trade(context, security, trade, take_profit, completed_bar.datetime, SELL_REASON_PROFIT_TARGET)
+                self.submit_sell(context, SellIntent(
+                    security=security, trade=trade,
+                    sell_reason=SELL_REASON_PROFIT_TARGET,
+                    fallback_price=take_profit,
+                ))
                 continue
 
             trade["last_checked_bar_dt"] = bar_dt
@@ -1725,6 +1825,7 @@ class TradeExecutor:
             if before_take > 0:
                 trade["take_profit_price"] = round(after_take, 4)
             self._record_position_snapshot("ADJUST", security, trade, dt_text, sell_price="", sell_reason="", pnl="")
+            self._safe_callback("on_position_adjusted", security, trade, dt_text, ratio, reason)
             adjusted_rows.append((trade.get("_trade_id"), before_qty, trade["buy_quantity"]))
 
         if adjusted_rows:
@@ -1755,57 +1856,629 @@ class TradeExecutor:
             for trade in list(self._open_trade_list(security)):
                 holding_days = self._holding_days(trade, self._current_dt(context))
                 if self._should_exit_by_holding_days(holding_days):
-                    self._submit_sell_order(context, security, trade, price, SELL_REASON_MAX_HOLDING_DAYS)
+                    self.submit_sell(context, SellIntent(
+                        security=security, trade=trade,
+                        sell_reason=SELL_REASON_MAX_HOLDING_DAYS, fallback_price=price,
+                    ))
                     continue
                 if self.stop_loss_enabled and price <= self._safe_float(trade.get("stop_loss_price", 0.0)):
-                    self._submit_sell_order(context, security, trade, price, SELL_REASON_STOP_LOSS)
+                    self.submit_sell(context, SellIntent(
+                        security=security, trade=trade,
+                        sell_reason=SELL_REASON_STOP_LOSS, fallback_price=price,
+                    ))
                     continue
                 if price >= self._safe_float(trade.get("take_profit_price", 0.0)):
-                    self._submit_sell_order(context, security, trade, price, SELL_REASON_PROFIT_TARGET)
+                    self.submit_sell(context, SellIntent(
+                        security=security, trade=trade,
+                        sell_reason=SELL_REASON_PROFIT_TARGET, fallback_price=price,
+                    ))
 
     def on_trade_response(self, context, trade_response):
         """
-        实盘成交回报：买入成交后才建立风控仓位；卖出成交后才写终态记录。
-        回测环境 is_trade()=False 时不会依赖该回调。
+        实盘成交回报：直接走 reconcile_pending_orders，复用同一套"以 PTrade
+        get_order / get_trades 真实成交结果为准"的写入逻辑，避免实盘 / 回测
+        两条不同的写入路径让 trade.csv 出现差异。
         """
         if not self._is_live_trade():
             return
-        order_id = self._read_any(trade_response, ["order_id", "entrust_no", "order_no", "id"])
-        if not order_id:
+        self.reconcile_pending_orders(context)
+
+    # ----- Pending order reconciliation -----
+    def reconcile_pending_orders(self, context):
+        """
+        核心对账入口：扫描所有挂起的买 / 卖订单，使用 PTrade 真实成交记录
+        （`get_order` / `get_trades`）写入 trade.csv 与 position_snapshot.csv。
+
+        - 同一笔订单可能跨多个 handle_data 周期才完全成交（PTrade 异步撮合），
+          这里维护"已记录数量 / 已记录金额 / 已记录手续费"的累计游标，
+          每周期只把"新增成交"那部分追加为新的开仓 / 平仓事件。
+        - 订单进入终态（全部成交 / 部分成交后撤单 / 完全撤单）时再从 pending 摘除；
+          若一直没拿到 get_order 数据就保持挂起，下一个周期继续轮询。
+        - 超时未成交时由 `_handle_pending_timeouts` 主动 cancel_order 并兜底摘除。
+        """
+        if not self.pending_buy_orders and not self.pending_sell_orders:
             return
-        order_id = str(order_id)
+        for order_id in list(self.pending_buy_orders.keys()):
+            try:
+                self._settle_pending_buy(context, order_id)
+            except Exception as e:
+                self.logger.error("结算挂起买单异常", order_id=order_id, err=e)
+        for order_id in list(self.pending_sell_orders.keys()):
+            try:
+                self._settle_pending_sell(context, order_id)
+            except Exception as e:
+                self.logger.error("结算挂起卖单异常", order_id=order_id, err=e)
+        # 仅对仍存在的 pending 进行超时处理（已经被 settle 摘除的不再扫描）。
+        self._handle_pending_timeouts(context)
 
-        price = self._safe_float(self._read_any(trade_response, ["price", "business_price", "filled_price", "trade_price"]))
-        qty = self._safe_float(self._read_any(trade_response, ["amount", "business_amount", "filled_amount", "trade_amount", "volume"]))
-        trade_dt = _format_dt(self._read_any(trade_response, ["datetime", "dt", "trade_time", "business_time"]))
-
-        if order_id in self.pending_buy_orders:
-            pending = self.pending_buy_orders.pop(order_id)
-            security = pending["security"]
-            if price <= 0:
-                price = self._safe_float(pending.get("fallback_price"))
-            if qty <= 0:
-                qty = self._safe_float(pending.get("fallback_qty"))
-            self._open_trade_from_fill(security, pending["event"], price, qty, trade_dt or pending["decision_dt"])
+    # ----- Pending order timeout protection -----
+    def _handle_pending_timeouts(self, context):
+        """
+        分两阶段处理超时挂单：
+          1. 软超时（`pending_order_timeout_days`）：第一次到达时主动 cancel_order
+             并 `timeout_cancel_attempted=True`，期望下一周期 reconcile 看到撤单
+             终态后走正常清理路径；
+          2. 硬超时（`pending_order_force_drop_days`）：撤单仍没生效或 PTrade
+             根本没暴露终态——强制摘除 pending 项，并触发 on_*_rejected(TIMEOUT)，
+             否则后续 _has_pending_sell_for_trade 会把同一笔仓位的止损永久封死。
+        """
+        if self.pending_order_timeout_days <= 0 and self.pending_order_force_drop_days <= 0:
+            return
+        if not self.pending_buy_orders and not self.pending_sell_orders:
+            return
+        now_dt = self._parse_dt(self._current_dt(context))
+        if now_dt is None:
             return
 
-        if order_id in self.pending_sell_orders:
-            pending = self.pending_sell_orders.pop(order_id)
-            security = pending["security"]
-            if price <= 0:
-                price = self._safe_float(pending.get("fallback_price"))
-            if qty <= 0:
-                qty = self._safe_float(pending.get("fallback_qty"))
+        for order_id in list(self.pending_buy_orders.keys()):
+            self._maybe_timeout_pending(context, "buy", order_id, now_dt)
+        for order_id in list(self.pending_sell_orders.keys()):
+            self._maybe_timeout_pending(context, "sell", order_id, now_dt)
+
+    def _maybe_timeout_pending(self, context, side, order_id, now_dt):
+        bucket = self.pending_buy_orders if side == "buy" else self.pending_sell_orders
+        pending = bucket.get(order_id)
+        if pending is None:
+            return
+        elapsed_days = self._pending_elapsed_days(pending, now_dt)
+        if elapsed_days is None:
+            return
+
+        # 硬超时：直接强制摘除，并触发 timeout 拒绝回调。
+        if (self.pending_order_force_drop_days > 0
+                and elapsed_days >= self.pending_order_force_drop_days):
+            self._force_drop_pending(side, order_id, pending, elapsed_days)
+            return
+
+        # 软超时：发起一次撤单，等下一周期 reconcile 收尾。
+        if (self.pending_order_timeout_days > 0
+                and elapsed_days >= self.pending_order_timeout_days
+                and not pending.get("timeout_cancel_attempted")):
+            self._cancel_timeout_pending(side, order_id, pending, elapsed_days)
+
+    def _pending_elapsed_days(self, pending, now_dt):
+        submit_dt = self._parse_dt(pending.get("submit_dt"))
+        if submit_dt is None:
+            return None
+        try:
+            return max(0, (now_dt.date() - submit_dt.date()).days)
+        except Exception:
+            return None
+
+    def _try_cancel_order(self, order_id):
+        """
+        发起一次撤单。兼容两种 cancel_order 签名：
+          - PTrade：`cancel_order(order_id_str)`
+          - SimTradeLab：`cancel_order(order_obj)`
+        任一签名成功即视为撤单已发出（最终是否真的撤掉由下个周期 reconcile 验证）。
+        """
+        try:
+            cancel_order(str(order_id))  # noqa: F821 - PTrade 注入
+            return True
+        except Exception:
+            pass
+        try:
+            ord_obj = get_order(str(order_id))  # noqa: F821 - PTrade 注入
+            if ord_obj is not None:
+                cancel_order(ord_obj)  # noqa: F821 - PTrade 注入
+                return True
+        except Exception as e:
+            self.logger.warning("尝试 cancel_order 失败（已尝试两种签名）", order_id=order_id, err=e)
+        return False
+
+    def _cancel_timeout_pending(self, side, order_id, pending, elapsed_days):
+        intent = pending["intent"]
+        filled_recorded = self._safe_float(pending.get("filled_qty_recorded", 0.0))
+        ok = self._try_cancel_order(order_id)
+        pending["timeout_cancel_attempted"] = True
+        self.logger.warning(
+            "委托超时未成交，已发起撤单等待下一周期收尾",
+            side=side, security=intent.security, order_id=order_id,
+            submit_dt=pending.get("submit_dt"),
+            elapsed_days=elapsed_days,
+            timeout_days=self.pending_order_timeout_days,
+            filled_qty_recorded=filled_recorded,
+            cancel_ok=ok,
+            sell_reason=getattr(intent, "sell_reason", None) if side == "sell" else None,
+        )
+
+    def _force_drop_pending(self, side, order_id, pending, elapsed_days):
+        intent = pending["intent"]
+        filled_recorded = self._safe_float(pending.get("filled_qty_recorded", 0.0))
+        # 再尝试一次撤单——尽管很可能已经撤过了，反复 cancel 是幂等的。
+        self._try_cancel_order(order_id)
+        self.logger.error(
+            "委托长时间无终态，强制摘除挂单追踪；后续 PTrade 若再回成交将无法落账，请人工对账",
+            side=side, security=intent.security, order_id=order_id,
+            submit_dt=pending.get("submit_dt"),
+            elapsed_days=elapsed_days,
+            force_drop_days=self.pending_order_force_drop_days,
+            filled_qty_recorded=filled_recorded,
+            sell_reason=getattr(intent, "sell_reason", None) if side == "sell" else None,
+        )
+        if side == "buy":
+            if filled_recorded <= 0:
+                self._safe_callback("on_buy_rejected", intent, BUY_REJECT_TIMEOUT)
+            self.pending_buy_orders.pop(order_id, None)
+        else:
+            if filled_recorded <= 0:
+                self._safe_callback("on_sell_rejected", intent, SELL_REJECT_TIMEOUT)
+            # 卖单 force-drop 时仓位仍在 open_trades 中——下个周期止损/止盈
+            # 触发器会重新评估并发起新的卖出意图。
+            self.pending_sell_orders.pop(order_id, None)
+
+    def _settle_pending_buy(self, context, order_id):
+        pending = self.pending_buy_orders.get(order_id)
+        if pending is None:
+            return
+        intent = pending["intent"]
+        state = self._fetch_order_state(context, order_id, intent.security)
+        if state is None:
+            return  # 还没拿到订单信息，下一周期再试
+
+        recorded_qty = self._safe_float(pending.get("filled_qty_recorded", 0.0))
+        new_filled = state["filled_qty"] - recorded_qty
+
+        if new_filled > 0:
+            recorded_gross = self._safe_float(pending.get("recorded_gross", 0.0))
+            recorded_commission = self._safe_float(pending.get("recorded_commission", 0.0))
+            delta_gross = max(0.0, state["gross_value"] - recorded_gross)
+            # 计算单股价格：优先用本次新增成交的金额平均；兜底依次为
+            # Order.limit/PTrade get_trades 价格 → 提交时的 fallback_price（昨收）。
+            avg_price = 0.0
+            if new_filled > 0 and delta_gross > 0:
+                avg_price = delta_gross / new_filled
+            if avg_price <= 0:
+                avg_price = self._safe_float(state.get("price_hint"))
+            if avg_price <= 0:
+                avg_price = self._safe_float(pending.get("fallback_price"))
+            if delta_gross <= 0 and avg_price > 0:
+                delta_gross = avg_price * new_filled
+            # 手续费：PTrade Python API 不暴露，state["commission"] 可能为 0；
+            # 此时按 _estimate_commission 自算，使 trade.csv 与 PTrade 引擎对齐。
+            delta_commission = max(0.0, state["commission"] - recorded_commission)
+            if delta_commission <= 0 and delta_gross > 0:
+                delta_commission = self._estimate_commission("buy", delta_gross)
+            fill_dt = (
+                _format_dt(state["fill_dt"]) or pending.get("submit_dt") or
+                _format_dt(self._current_dt(context))
+            )
+
+            self._open_trade_from_fill(
+                intent, avg_price, int(new_filled), fill_dt,
+                buy_order_id=order_id, buy_commission=delta_commission,
+            )
+            self.logger.info(
+                "买入成交回报已记录",
+                security=intent.security, order_id=order_id,
+                fill_qty=int(new_filled), fill_price=round(avg_price, 4),
+                fill_commission=round(delta_commission, 4), fill_dt=fill_dt,
+            )
+
+            # 累计游标用"max(实际累计, 推算累计)"——PTrade 没暴露 gross/commission
+            # 时 state 给的是 0，避免下次 reconcile 把已记账的 delta 又算一次。
+            pending["filled_qty_recorded"] = state["filled_qty"]
+            pending["recorded_gross"] = max(
+                self._safe_float(pending.get("recorded_gross", 0.0)) + delta_gross,
+                state["gross_value"],
+            )
+            pending["recorded_commission"] = max(
+                self._safe_float(pending.get("recorded_commission", 0.0)) + delta_commission,
+                state["commission"],
+            )
+
+        if state["is_terminal"]:
+            if self._safe_float(pending.get("filled_qty_recorded", 0.0)) <= 0:
+                self.logger.info(
+                    "买入委托终态未成交",
+                    security=intent.security, order_id=order_id,
+                )
+                self._safe_callback("on_buy_rejected", intent, BUY_REJECT_ORDER_REJECTED)
+            self.pending_buy_orders.pop(order_id, None)
+
+    def _settle_pending_sell(self, context, order_id):
+        pending = self.pending_sell_orders.get(order_id)
+        if pending is None:
+            return
+        intent = pending["intent"]
+        state = self._fetch_order_state(context, order_id, intent.security)
+        if state is None:
+            return
+
+        recorded_qty = self._safe_float(pending.get("filled_qty_recorded", 0.0))
+        new_filled = state["filled_qty"] - recorded_qty
+
+        if new_filled > 0:
+            recorded_gross = self._safe_float(pending.get("recorded_gross", 0.0))
+            recorded_commission = self._safe_float(pending.get("recorded_commission", 0.0))
+            delta_gross = max(0.0, state["gross_value"] - recorded_gross)
+            avg_price = 0.0
+            if new_filled > 0 and delta_gross > 0:
+                avg_price = delta_gross / new_filled
+            if avg_price <= 0:
+                avg_price = self._safe_float(state.get("price_hint"))
+            if avg_price <= 0:
+                avg_price = self._safe_float(pending.get("fallback_price"))
+            if delta_gross <= 0 and avg_price > 0:
+                delta_gross = avg_price * new_filled
+            delta_commission = max(0.0, state["commission"] - recorded_commission)
+            if delta_commission <= 0 and delta_gross > 0:
+                delta_commission = self._estimate_commission("sell", delta_gross)
+            fill_dt = (
+                _format_dt(state["fill_dt"]) or pending.get("submit_dt") or
+                _format_dt(self._current_dt(context))
+            )
+
             self._last_portfolio_snapshot = self._portfolio_snapshot(context)
-            self._finalize_sell(security, pending["trade"], price, trade_dt or pending["sell_date"], pending["sell_reason"], qty)
+            self._finalize_sell(
+                intent, avg_price, fill_dt,
+                sell_qty=int(new_filled), sell_order_id=order_id,
+                sell_commission=delta_commission,
+            )
+            self.logger.info(
+                "卖出成交回报已记录",
+                security=intent.security, order_id=order_id,
+                fill_qty=int(new_filled), fill_price=round(avg_price, 4),
+                fill_commission=round(delta_commission, 4), fill_dt=fill_dt,
+            )
+
+            pending["filled_qty_recorded"] = state["filled_qty"]
+            pending["recorded_gross"] = max(
+                self._safe_float(pending.get("recorded_gross", 0.0)) + delta_gross,
+                state["gross_value"],
+            )
+            pending["recorded_commission"] = max(
+                self._safe_float(pending.get("recorded_commission", 0.0)) + delta_commission,
+                state["commission"],
+            )
+
+        if state["is_terminal"]:
+            if self._safe_float(pending.get("filled_qty_recorded", 0.0)) <= 0:
+                self.logger.warning(
+                    "卖出委托终态未成交，仓位维持开仓状态",
+                    security=intent.security, order_id=order_id,
+                    sell_reason=intent.sell_reason,
+                )
+                self._safe_callback("on_sell_rejected", intent, SELL_REJECT_TERMINAL_NO_FILL)
+            self.pending_sell_orders.pop(order_id, None)
+
+    def _fetch_order_state(self, context, order_id, security):
+        """
+        从 PTrade / SimTradeLab 拉取一笔订单的当前状态。
+        返回 dict（含 filled_qty / total_amount / gross_value / commission /
+        fill_dt / is_terminal / status / price_hint）；拿不到任何信息时返回 None。
+
+        关键设计：
+          * **PTrade `get_order(order_id)` 返回的是 `list[Order]`**（见官方文档 5742 行），
+            字段为 `id / dt / limit / symbol / amount / filled / status / entrust_no`，
+            **没有** business_amount / business_price / business_balance / commission；
+            SimTradeLab 返回的是单个 Order 对象，字段名也不一定相同。
+            这里统一展开成同名 key 后再读，避免 isinstance(list) 时被当成无属性对象。
+          * **PTrade 不暴露真实成交价 / 手续费**：成交价用 `limit` 兜底，手续费由
+            `_estimate_commission` 按同步的费率公式自算（见 _settle_pending_buy/sell 用法）。
+          * `get_trades` 的返回结构两边完全不同，由 `_aggregate_trades_for_order` 处理。
+        """
+        ord_obj = None
+        try:
+            ord_obj = get_order(str(order_id))  # noqa: F821 - PTrade 注入
+        except Exception:
+            ord_obj = None
+
+        ord_records = self._normalize_order_objects(ord_obj)
+
+        filled_qty = 0.0
+        total_amount = 0.0
+        gross_value = 0.0
+        commission = 0.0
+        fill_dt = None
+        status_text = ""
+        price_hint = 0.0
+        found = False
+
+        for rec in ord_records:
+            found = True
+            # PTrade Order: filled / amount / status / entrust_no / limit / dt
+            # SimTradeLab Order: 字段名兼容多套（business_amount/filled/filled_amount...）
+            filled = abs(self._safe_float(self._read_any(
+                rec, ["filled", "business_amount", "filled_amount", "trade_amount"],
+            )))
+            total = abs(self._safe_float(self._read_any(
+                rec, ["amount", "entrust_amount", "volume"],
+            )))
+            limit_price = self._safe_float(self._read_any(
+                rec, ["business_price", "filled_price", "trade_price", "avg_price", "limit_price", "limit"],
+            ))
+            balance = self._safe_float(self._read_any(
+                rec, ["business_balance", "trade_balance"],
+            ))
+            comm = self._safe_float(self._read_any(
+                rec, ["commission", "fee", "fees", "transfer_fee"],
+            )) + self._safe_float(self._read_any(rec, ["stamp_tax", "tax"]))
+            dt_value = self._read_any(
+                rec, ["business_time", "trade_time", "filled_time", "dt", "datetime", "created"],
+            )
+            status_value = self._read_any(rec, ["status", "order_status", "state"])
+
+            filled_qty = max(filled_qty, filled)
+            if total > total_amount:
+                total_amount = total
+            if balance > gross_value:
+                gross_value = balance
+            elif filled > 0 and limit_price > 0:
+                gross_value = max(gross_value, filled * limit_price)
+            if comm > commission:
+                commission = comm
+            if dt_value is not None:
+                fill_dt = dt_value
+            if status_value:
+                status_text = str(status_value)
+            if limit_price > 0:
+                price_hint = limit_price
+
+        # 用 get_trades 的逐笔成交补齐——尤其是 PTrade，需要从这里拿真实成交价。
+        trades_qty, trades_value, trades_comm, trades_dt, trades_price = self._aggregate_trades_for_order(
+            security, order_id,
+        )
+        if trades_qty > filled_qty:
+            found = True
+            filled_qty = trades_qty
+        if trades_value > gross_value:
+            gross_value = trades_value
+        if trades_comm > commission:
+            commission = trades_comm
+        if trades_dt is not None:
+            fill_dt = trades_dt
+        if trades_price > 0:
+            price_hint = trades_price
+
+        if not found:
+            return None
+
+        if total_amount <= 0:
+            total_amount = filled_qty
+
+        return {
+            "filled_qty": filled_qty,
+            "total_amount": total_amount,
+            "gross_value": gross_value,
+            "commission": commission,
+            "fill_dt": fill_dt,
+            "price_hint": price_hint,
+            "is_terminal": self._is_order_terminal(status_text, filled_qty, total_amount),
+            "status": status_text,
+        }
+
+    @staticmethod
+    def _normalize_order_objects(raw):
+        """
+        统一把 `get_order` / `get_orders` 的返回值规约为 `list[record]` 形式：
+          * PTrade：`list[Order]` -> 直接返回
+          * SimTradeLab：单 Order 对象 -> 包成 list
+          * dict（极少见但兼容）：包成 list
+          * None / 空 -> []
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple)):
+            return [r for r in raw if r is not None]
+        return [raw]
+
+    def _aggregate_trades_for_order(self, security, order_id):
+        """
+        按 entrust_no 把 `get_trades()` 的成交流水按订单聚合。
+        返回 (sum_qty, sum_value, sum_commission, last_dt, avg_price)。
+
+        两套引擎返回结构不同：
+          * **PTrade `get_trades()`**（无参）返回 `dict{order_id: list[list]}`，
+            list 字段位置式：`[成交编号, 委托编号, 标的代码, 买卖类型, 成交数量,
+            成交价格, 成交金额, 成交时间]`，**没有 commission / 手续费字段**。
+          * **SimTradeLab `get_trades(security)`** 返回 `list[dict]`，dict 字段
+            包含 business_amount / business_price / business_balance / commission 等。
+
+        手续费两套都不一定有真实值——PTrade 完全没有，SimTradeLab 视版本而定。
+        统一让 `_settle_pending_*` 在 commission <= 0 时用 `_estimate_commission` 兜底。
+        """
+        target = str(order_id)
+        # 先尝试无参（PTrade 唯一签名），再回退带 security 的形式（SimTradeLab）。
+        trades = None
+        try:
+            trades = get_trades()  # noqa: F821 - PTrade 注入
+        except Exception:
+            trades = None
+        if trades is None or self._is_empty_trades(trades):
+            try:
+                trades = get_trades(security)  # noqa: F821 - PTrade 注入
+            except Exception:
+                trades = None
+
+        if trades is None or self._is_empty_trades(trades):
+            return 0.0, 0.0, 0.0, None, 0.0
+
+        sum_qty = 0.0
+        sum_value = 0.0
+        sum_commission = 0.0
+        last_dt = None
+
+        if isinstance(trades, dict):
+            # PTrade：dict[order_id] = list[list(8字段)]
+            entries = trades.get(target) or trades.get(str(target))
+            # 有些 PTrade 版本会用证券代码而非 order_id 当 key——退化为对所有
+            # value 检查 entrust_no（位置 1）。
+            if entries is None:
+                for _, value in trades.items():
+                    for row in (value or []):
+                        if self._ptrade_trade_entrust_no(row) == target:
+                            qty, price, value_amt, dt_val = self._ptrade_trade_fields(row)
+                            sum_qty += qty
+                            if value_amt > 0:
+                                sum_value += value_amt
+                            elif qty > 0 and price > 0:
+                                sum_value += qty * price
+                            if dt_val is not None:
+                                last_dt = dt_val
+                # PTrade 不暴露 commission，留 0 由策略自算。
+            else:
+                for row in entries:
+                    qty, price, value_amt, dt_val = self._ptrade_trade_fields(row)
+                    sum_qty += qty
+                    if value_amt > 0:
+                        sum_value += value_amt
+                    elif qty > 0 and price > 0:
+                        sum_value += qty * price
+                    if dt_val is not None:
+                        last_dt = dt_val
+        else:
+            # SimTradeLab：list[dict]
+            for t in trades:
+                t_id = self._read_any(t, ["entrust_no", "order_id", "id"])
+                if not t_id or str(t_id) != target:
+                    continue
+                qty = abs(self._safe_float(self._read_any(
+                    t, ["business_amount", "amount", "trade_amount", "filled"],
+                )))
+                price = self._safe_float(self._read_any(
+                    t, ["business_price", "trade_price", "filled_price", "price", "limit"],
+                ))
+                balance = self._safe_float(self._read_any(
+                    t, ["business_balance", "trade_balance"],
+                ))
+                comm = self._safe_float(self._read_any(
+                    t, ["commission", "fee", "fees", "transfer_fee"],
+                )) + self._safe_float(self._read_any(t, ["stamp_tax", "tax"]))
+                dt_val = self._read_any(t, ["business_time", "trade_time", "filled_time", "dt", "datetime"])
+
+                sum_qty += qty
+                if balance > 0:
+                    sum_value += balance
+                elif qty > 0 and price > 0:
+                    sum_value += qty * price
+                sum_commission += comm
+                if dt_val is not None:
+                    last_dt = dt_val
+
+        avg_price = sum_value / sum_qty if sum_qty > 0 and sum_value > 0 else 0.0
+        return sum_qty, sum_value, sum_commission, last_dt, avg_price
+
+    @staticmethod
+    def _is_empty_trades(trades):
+        try:
+            if isinstance(trades, dict):
+                return len(trades) == 0
+            return not trades
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ptrade_trade_entrust_no(row):
+        """PTrade `get_trades()` value 中每一行 list 的 [1] 位置是委托编号。"""
+        try:
+            return str(row[1]) if row is not None and len(row) >= 2 else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _ptrade_trade_fields(row):
+        """
+        解析 PTrade `get_trades()` 中位置式 list：
+            [成交编号, 委托编号, 标的代码, 买卖类型, 成交数量, 成交价格, 成交金额, 成交时间]
+        """
+        try:
+            qty = abs(float(row[4])) if len(row) > 4 else 0.0
+        except Exception:
+            qty = 0.0
+        try:
+            price = float(row[5]) if len(row) > 5 else 0.0
+        except Exception:
+            price = 0.0
+        try:
+            value = abs(float(row[6])) if len(row) > 6 else 0.0
+        except Exception:
+            value = 0.0
+        dt_val = row[7] if len(row) > 7 else None
+        return qty, price, value, dt_val
+
+    def _estimate_commission(self, side, gross_value):
+        """
+        按 PTrade `set_commission` 同款公式自算手续费。
+            * 佣金费 = max(commission_ratio * gross, min_commission)
+            * 经手费 = transfer_fee_ratio * gross
+            * 印花税 = stamp_tax_ratio * gross （仅卖出）
+        side: "buy" / "sell"。
+        gross_value: 成交毛额（数量 × 价格）。
+        """
+        gross = max(0.0, self._safe_float(gross_value))
+        if gross <= 0:
+            return 0.0
+        commission = max(self.commission_ratio * gross, self.min_commission)
+        transfer_fee = self.transfer_fee_ratio * gross
+        stamp_tax = self.stamp_tax_ratio * gross if str(side).lower() == "sell" else 0.0
+        return commission + transfer_fee + stamp_tax
+
+    @staticmethod
+    def _is_order_terminal(status_text, filled_qty, total_amount):
+        """
+        判断订单是否进入终态。
+
+        PTrade 状态码（见官方文档"数据字典 > status"段）：
+          * "0" 未报 / "1" 待报 / "2" 已报 / "3" 已报待撤 / "4" 部成待撤
+            / "+" 已受理 / "-" 已确认 / "C" 正报 / "V" 已确认  →  非终态
+          * "5" 部撤 / "6" 已撤 / "7" 部成 / "8" 已成 / "9" 废单         →  终态
+        SimTradeLab 也用同一套数字状态码（部分版本），加上 "filled/cancelled" 等
+        英文文本——这里两条路径都做兼容。
+        """
+        if total_amount > 0 and filled_qty >= total_amount:
+            return True
+        s = (status_text or "").strip().lower()
+        terminal_tokens = (
+            "filled", "fully", "all_filled", "alldealt", "all_dealt", "全部成交", "已成",
+            "cancel", "cancelled", "canceled", "撤单", "已撤", "部撤",
+            "rejected", "废单", "reject",
+            "expired", "已过期",
+        )
+        if any(tok in s for tok in terminal_tokens):
+            return True
+        # 注意：PTrade "2" 是 "已报"（非终态），不能纳入；"7"（部成）严格说也非终态，
+        # 但实际 PTrade 回测下 7 通常意味着不会再继续撮合（日终），保留为终态兼容。
+        if s in {"5", "6", "7", "8", "9"}:
+            return True
+        return False
 
     # ----- Buy side -----
-    def _try_buy_from_signal(self, context, security, ev):
+    def submit_buy(self, context, intent):
+        """
+        提交一笔买入意图。本方法只负责通用校验（开关、最小金额、可用资金）和
+        实际下单 + 挂入 pending；所有策略相关的预检（如完美 Setup 校验）
+        必须在 BuyIntent 抵达本层之前就完成。
+
+        - 通用拒单：触发 `callbacks.on_buy_rejected(intent, reason)` 让策略层决定
+          如何写 trade.csv 终态行；
+        - 真实成交后：在 `_settle_pending_buy` 中调用 `_open_trade_from_fill`，
+          后者会回调 `callbacks.on_buy_filled(intent, trade, fill)`。
+        """
+        security = intent.security
+
         if not self.enabled:
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_TRADE_DISABLED)
-            return
-        if self.require_perfect_setup_for_buy and not self._boolish(ev.get("setup_perfect")):
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_NON_PERFECT_SETUP)
+            self._safe_callback("on_buy_rejected", intent, BUY_REJECT_TRADE_DISABLED)
             return
 
         snap = self._portfolio_snapshot(context)
@@ -1814,248 +2487,266 @@ class TradeExecutor:
         target_value = total_value * self.buy_fraction
 
         if target_value < self.min_trade_value:
-            self.logger.info("买入取消：目标金额低于最小交易金额", security=security, target_value=round(target_value, 2))
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_MIN_TRADE_VALUE)
+            self.logger.info(
+                "买入取消：目标金额低于最小交易金额",
+                security=security, target_value=round(target_value, 2),
+            )
+            self._safe_callback("on_buy_rejected", intent, BUY_REJECT_MIN_TRADE_VALUE)
             return
         if available_cash < self.min_cash_for_buy:
             self.logger.info(
                 "买入取消：现金不足",
-                security=security, available_cash=round(available_cash, 2), min_cash_for_buy=self.min_cash_for_buy,
-                snapshot=snap["debug"],
+                security=security, available_cash=round(available_cash, 2),
+                min_cash_for_buy=self.min_cash_for_buy, snapshot=snap["debug"],
             )
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_INSUFFICIENT_CASH)
+            self._safe_callback("on_buy_rejected", intent, BUY_REJECT_INSUFFICIENT_CASH)
             return
 
         actual_value = min(target_value, available_cash)
         if actual_value < self.min_trade_value:
-            self.logger.info("买入取消：实际可买金额低于最小交易金额", security=security, actual_value=round(actual_value, 2))
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_MIN_TRADE_VALUE)
+            self.logger.info(
+                "买入取消：实际可买金额低于最小交易金额",
+                security=security, actual_value=round(actual_value, 2),
+            )
+            self._safe_callback("on_buy_rejected", intent, BUY_REJECT_MIN_TRADE_VALUE)
             return
 
-        decision_dt = _format_dt(self._current_dt(context))
-        fallback_price = self._safe_float(ev.get("bar_close"))
-        before_qty, _, _ = self._get_position_detail(security) if not self._is_live_trade() else (0.0, 0.0, 0.0)
+        submit_dt = _format_dt(self._current_dt(context))
+        fallback_price = intent.fallback_price
+
         try:
             order_id = order_value(security, actual_value)  # noqa: F821 - PTrade 注入
         except Exception as e:
-            self.logger.error("买入 order_value 调用失败", security=security, err=e, value=actual_value)
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_ORDER_ERROR)
+            self.logger.error(
+                "买入 order_value 调用失败",
+                security=security, err=e, value=actual_value,
+            )
+            self._safe_callback("on_buy_rejected", intent, BUY_REJECT_ORDER_ERROR)
             return
         if not order_id:
-            self.logger.info("买入取消：order_value 未返回订单号", security=security, actual_value=round(actual_value, 2))
-            self._record_terminal(ev, bought=False, buy_reject_reason=BUY_REJECT_ORDER_REJECTED)
+            self.logger.info(
+                "买入取消：order_value 未返回订单号",
+                security=security, actual_value=round(actual_value, 2),
+            )
+            self._safe_callback("on_buy_rejected", intent, BUY_REJECT_ORDER_REJECTED)
             return
 
-        if self._is_live_trade():
-            self.pending_buy_orders[str(order_id)] = {
-                "security": security, "event": ev, "decision_dt": decision_dt,
-                "fallback_price": fallback_price, "fallback_qty": 0.0,
-            }
-            self.logger.info("买入委托已提交，等待成交回报", security=security, order_id=order_id, value=round(actual_value, 2))
-            return
-
-        # 回测降级：优先用下单前后持仓差额确认本笔真实成交数量；
-        # 若兼容层无法读取变化，再按本次委托金额兜底估算。
-        after_qty, _, entry_price = self._get_position_detail(security)
-        qty = self._infer_backtest_buy_quantity(security, actual_value, fallback_price, before_qty, after_qty)
-        if entry_price <= 0:
-            entry_price = fallback_price
-        self._open_trade_from_fill(security, ev, entry_price, qty, decision_dt)
+        order_id = str(order_id)
+        self.pending_buy_orders[order_id] = {
+            "intent": intent,
+            "security": security,
+            "submit_dt": submit_dt,
+            "fallback_price": fallback_price,
+            "filled_qty_recorded": 0.0,
+            "recorded_gross": 0.0,
+            "recorded_commission": 0.0,
+        }
         self.logger.info(
-            "买入完成（回测近似成交）",
-            security=security, order_id=order_id, buy_qty=qty, buy_price=round(entry_price, 4),
+            "买入委托已提交，等待真实成交回报",
+            security=security, order_id=order_id, value=round(actual_value, 2),
         )
 
-    def _open_trade_from_fill(self, security, ev, buy_price, buy_qty, buy_date):
-        stop_loss, take_profit = self._calc_risk_prices(ev, buy_price)
-        row = self._base_trade_record(ev, COUNTDOWN_STATUS_NORMAL)
+    def _open_trade_from_fill(self, intent, buy_price, buy_qty, buy_date,
+                              buy_order_id="", buy_commission=0.0):
+        """
+        根据真实成交回报新建一笔 open_trade（**完全通用、不含 TD 字段**）。
+        策略层在 `on_buy_filled` 回调里再补充 stop_loss_price / take_profit_price
+        与策略私有上下文（如 TD 信号字段，统一塞到 `trade["_strategy_metadata"]`）。
+        """
+        security = intent.security
         entry_value = buy_price * buy_qty if buy_price and buy_qty else 0.0
-        row.update({
+        trade = {
             "_trade_id": self._next_trade_id,
-            "bought": True,
-            "buy_reject_reason": "",
+            "_strategy_metadata": {},
+            "security": security,
+            "buy_order_id": str(buy_order_id) if buy_order_id else "",
             "buy_quantity": buy_qty,
             "buy_price": round(buy_price, 4),
+            "buy_commission": round(self._safe_float(buy_commission), 4),
             "buy_date": buy_date,
             "entry_value": round(entry_value, 2),
-            "stop_loss_price": round(stop_loss, 4) if stop_loss else "",
-            "take_profit_price": round(take_profit, 4) if take_profit else "",
-            "sell_price": "",
-            "sell_date": "",
-            "sell_reason": "",
-            "price_pnl": "",
+            "stop_loss_price": "",
+            "take_profit_price": "",
             "dividend_income": 0.0,
-            "pnl": "",
-        })
+            # 用真实成交日期作为基准——避免下个 cycle 立刻拿成交当天的 K 线高低点去
+            # 触发刚开仓的止盈止损（毕竟买入是收盘成交，bar 内的高低点早就过去了）。
+            "last_checked_bar_dt": buy_date or "",
+        }
         self._next_trade_id += 1
-        row["last_checked_bar_dt"] = ev.get("datetime", "")
-        self.open_trades.setdefault(security, []).append(row)
-        self._record_position_snapshot("OPEN", security, row, buy_date, sell_price="", sell_reason="", pnl="")
+        self.open_trades.setdefault(security, []).append(trade)
 
-    def _calc_risk_prices(self, ev, buy_price):
-        low = self._safe_float(ev.get("countdown_low"))
-        high = self._safe_float(ev.get("countdown_low_bar_high"))
-        if low <= 0 or high <= 0 or high < low:
-            return "", ""
-        raw_stop_loss = low - (high - low) * self.stop_loss_range_multiple
-        take_profit = buy_price + (buy_price - raw_stop_loss) * self.profit_target_r_multiple
-        stop_loss = raw_stop_loss if self.stop_loss_enabled else ""
-        return stop_loss, take_profit
+        fill = FillInfo(
+            order_id=buy_order_id, security=security, side="buy",
+            quantity=buy_qty, price=buy_price,
+            commission=self._safe_float(buy_commission), fill_dt=buy_date,
+        )
+        # 让策略层在快照写入前完成 SL / TP / 私有上下文的填充——确保
+        # position_snapshot.csv 的 OPEN 行能拿到完整字段。
+        self._safe_callback("on_buy_filled", intent, trade, fill)
+
+        self._record_position_snapshot(
+            "OPEN", security, trade, buy_date,
+            sell_price="", sell_reason="", pnl="",
+        )
 
     # ----- Sell side / exits -----
-    def _try_sell_on_sell_countdown(self, context, security, ev):
-        trades = self._open_trade_list(security)
-        if not self.take_profit_on_sell_countdown or not trades:
-            return
-        ref_price = self._safe_float(ev.get("bar_close"))
-        for trade in list(trades):
-            buy_price = self._safe_float(trade.get("buy_price"))
-            if ref_price > buy_price:
-                self._sell_open_trade(context, security, trade, ref_price, ev.get("datetime", ""), SELL_REASON_TREND_REVERSAL)
-            else:
-                self.logger.info(
-                    "Sell Countdown 出现但该笔仓位未盈利，不做趋势反转止盈",
-                    security=security, trade_id=trade.get("_trade_id"),
-                    ref_price=round(ref_price, 4), buy_price=round(buy_price, 4),
-                )
+    def submit_sell(self, context, intent):
+        """
+        提交一笔卖出意图。本方法只下单 + 挂 pending；卖出价 / 数量 /
+        成交时间 / 手续费等真实成交结果由 `reconcile_pending_orders` 落账。
+        """
+        security = intent.security
+        trade = intent.trade
 
-    def _submit_sell_order(self, context, security, trade, fallback_price, sell_reason):
-        if not self._trade_is_open(security, trade) or self._has_pending_sell_for_trade(trade):
+        if not self._trade_is_open(security, trade):
+            return
+        if self._has_pending_sell_for_trade(trade):
             return
         sell_qty = self._sell_quantity(trade)
         if sell_qty <= 0:
-            self.logger.info("卖出委托未提交：该笔仓位数量无效", security=security, trade_id=trade.get("_trade_id"), reason=sell_reason)
+            self.logger.info(
+                "卖出委托未提交：该笔仓位数量无效",
+                security=security, trade_id=trade.get("_trade_id"),
+                reason=intent.sell_reason,
+            )
+            self._safe_callback("on_sell_rejected", intent, SELL_REJECT_INVALID_QTY)
             return
+
+        submit_dt = _format_dt(self._current_dt(context))
         try:
             order_id = order(security, -sell_qty)  # noqa: F821 - PTrade 注入
         except Exception as e:
-            self.logger.error("卖出 order 调用失败", security=security, err=e, quantity=-sell_qty, reason=sell_reason)
+            self.logger.error(
+                "卖出 order 调用失败",
+                security=security, err=e, quantity=-sell_qty, reason=intent.sell_reason,
+            )
+            self._safe_callback("on_sell_rejected", intent, SELL_REJECT_ORDER_ERROR)
             return
         if not order_id:
-            self.logger.info("卖出委托未提交", security=security, quantity=sell_qty, reason=sell_reason)
+            self.logger.info(
+                "卖出委托未提交：order 未返回订单号",
+                security=security, quantity=sell_qty, reason=intent.sell_reason,
+            )
+            self._safe_callback("on_sell_rejected", intent, SELL_REJECT_ORDER_REJECTED)
             return
-        self.pending_sell_orders[str(order_id)] = {
+
+        order_id = str(order_id)
+        self.pending_sell_orders[order_id] = {
+            "intent": intent,
             "security": security,
             "trade": trade,
-            "sell_reason": sell_reason,
-            "sell_date": _format_dt(self._current_dt(context)),
-            "fallback_price": fallback_price,
+            "sell_reason": intent.sell_reason,
+            "submit_dt": submit_dt,
+            "fallback_price": intent.fallback_price,
             "fallback_qty": sell_qty,
+            "filled_qty_recorded": 0.0,
+            "recorded_gross": 0.0,
+            "recorded_commission": 0.0,
         }
+        self.logger.info(
+            "卖出委托已提交，等待真实成交回报",
+            security=security, order_id=order_id, qty=sell_qty,
+            reason=intent.sell_reason,
+        )
 
-    def _sell_open_trade(self, context, security, trade, sell_price, sell_date, sell_reason):
+    def _finalize_sell(self, intent, sell_price, sell_date, sell_qty=None,
+                       sell_order_id="", sell_commission=0.0):
+        """
+        根据真实成交回报落账一笔卖出（部分 / 完全平仓）。
+        - 计算 PnL 各组成部分并构造 `pnl_breakdown` dict；
+        - 写 position_snapshot CLOSE（通用快照，不含策略私有字段）；
+        - 通过 `callbacks.on_sell_filled` 把完整 PnL 数据交还策略层，
+          由策略层决定如何写 `<SEC>/trade.csv` / 根目录 `trade.csv` 等终态行。
+        """
+        security = intent.security
+        trade = intent.trade
         if not self._trade_is_open(security, trade):
             return
-        if self._is_live_trade():
-            self._submit_sell_order(context, security, trade, sell_price, sell_reason)
-            return
-        sell_qty = self._sell_quantity(trade)
-        if sell_qty <= 0:
-            self.logger.info("卖出委托未提交：该笔仓位数量无效", security=security, trade_id=trade.get("_trade_id"), reason=sell_reason)
-            return
-        before_qty, _, _ = self._get_position_detail(security)
-        try:
-            order_id = order(security, -sell_qty)  # noqa: F821 - PTrade 注入
-        except Exception as e:
-            self.logger.error("卖出 order 调用失败", security=security, err=e, quantity=-sell_qty, reason=sell_reason)
-            return
-        if not order_id:
-            self.logger.info("卖出委托未提交", security=security, quantity=sell_qty, reason=sell_reason)
-            return
-        self._last_portfolio_snapshot = self._portfolio_snapshot(context)
-        executed_qty = self._infer_backtest_sell_quantity(security, sell_qty, before_qty)
-        self._finalize_sell(security, trade, sell_price, sell_date, sell_reason, executed_qty)
 
-    def _finalize_sell(self, security, trade, sell_price, sell_date, sell_reason, sell_qty=None):
-        if not self._trade_is_open(security, trade):
-            return
-        row = dict(trade)
-        buy_price = self._safe_float(row.get("buy_price"))
-        original_qty = self._safe_float(row.get("buy_quantity"))
+        buy_price = self._safe_float(trade.get("buy_price"))
+        original_qty = self._safe_float(trade.get("buy_quantity"))
         qty = self._safe_float(sell_qty) if sell_qty is not None else original_qty
         if qty <= 0:
             qty = original_qty
         if original_qty > 0 and qty > original_qty:
             qty = original_qty
+
         price_pnl = (sell_price - buy_price) * qty
         dividend_total = self._safe_float(trade.get("dividend_income"))
         dividend_income = dividend_total * qty / original_qty if original_qty > 0 else 0.0
-        pnl = price_pnl + dividend_income
-        if qty < original_qty:
+        buy_commission_total = self._safe_float(trade.get("buy_commission"))
+        buy_commission_for_qty = (
+            buy_commission_total * qty / original_qty if original_qty > 0 else 0.0
+        )
+        sell_commission_value = self._safe_float(sell_commission)
+        net_pnl = price_pnl + dividend_income - buy_commission_for_qty - sell_commission_value
+
+        is_terminal_close = qty >= original_qty
+        # 在变更 trade 状态前，先抓一份"本次平仓对应"的快照值给回调使用，
+        # 避免回调读到的 buy_quantity 是部分平仓后的剩余数量。
+        snapshot_for_close = {
+            "_trade_id": trade.get("_trade_id"),
+            "buy_order_id": trade.get("buy_order_id", ""),
+            "buy_quantity": qty,
+            "buy_price": trade.get("buy_price", ""),
+            "buy_commission": round(buy_commission_for_qty, 4),
+            "buy_date": trade.get("buy_date", ""),
+            "entry_value": round(buy_price * qty, 2),
+            "stop_loss_price": trade.get("stop_loss_price", ""),
+            "take_profit_price": trade.get("take_profit_price", ""),
+            "sell_order_id": str(sell_order_id) if sell_order_id else "",
+            "sell_price": round(sell_price, 4),
+            "sell_commission": round(sell_commission_value, 4),
+        }
+
+        if not is_terminal_close:
             remaining_qty = original_qty - qty
+            remaining_buy_commission = max(0.0, buy_commission_total - buy_commission_for_qty)
             trade["buy_quantity"] = remaining_qty
             trade["entry_value"] = round(buy_price * remaining_qty, 2)
             trade["dividend_income"] = round(max(0.0, dividend_total - dividend_income), 2)
-            row["buy_quantity"] = qty
-            row["entry_value"] = round(buy_price * qty, 2)
+            trade["buy_commission"] = round(remaining_buy_commission, 4)
         else:
             self._remove_open_trade(security, trade)
-        row.update({
-            "datetime": sell_date,
-            "sell_price": round(sell_price, 4),
-            "sell_date": sell_date,
-            "sell_reason": sell_reason,
+
+        # 通用 position_snapshot：CLOSE 行只描述本次平仓的数量 / 价格 / pnl。
+        self._record_position_snapshot(
+            "CLOSE", security, snapshot_for_close, sell_date,
+            sell_price=sell_price, sell_reason=intent.sell_reason, pnl=net_pnl,
+        )
+
+        fill = FillInfo(
+            order_id=sell_order_id, security=security, side="sell",
+            quantity=int(qty), price=sell_price,
+            commission=sell_commission_value, fill_dt=sell_date,
+        )
+        pnl_breakdown = {
+            "sold_qty": int(qty),
+            "remaining_qty": int(max(0.0, original_qty - qty)),
+            "is_terminal_close": is_terminal_close,
+            "buy_price": round(buy_price, 4),
+            "buy_commission_for_qty": round(buy_commission_for_qty, 4),
+            "entry_value": round(buy_price * qty, 2),
             "price_pnl": round(price_pnl, 2),
             "dividend_income": round(dividend_income, 2),
-            "pnl": round(pnl, 2),
-        })
-        self.trade_recorder.record(row)
-        self._record_position_snapshot("CLOSE", security, row, sell_date, sell_price=sell_price, sell_reason=sell_reason, pnl=pnl)
-        if qty < original_qty:
-            self.logger.info("交易部分平仓", security=security, sell_reason=sell_reason, sell_qty=qty, remaining_qty=original_qty - qty, pnl=round(pnl, 2))
-        else:
-            self.logger.info("交易生命周期结束", security=security, sell_reason=sell_reason, sell_qty=qty, pnl=round(pnl, 2))
-
-    # ----- Records -----
-    def _record_terminal(self, ev, bought=False, buy_reject_reason="", countdown_status=None):
-        if self.trade_recorder is None:
-            return
-        status = countdown_status or self._countdown_status(ev)
-        row = self._base_trade_record(ev, status)
-        row.update({
-            "datetime": ev.get("datetime", ""),
-            "bought": bool(bought),
-            "buy_reject_reason": buy_reject_reason,
-            "buy_quantity": "",
-            "buy_price": "",
-            "buy_date": "",
-            "entry_value": "",
-            "stop_loss_price": "",
-            "take_profit_price": "",
-            "sell_price": "",
-            "sell_date": "",
-            "sell_reason": "",
-            "price_pnl": "",
-            "dividend_income": "",
-            "pnl": "",
-        })
-        self.trade_recorder.record(row)
-
-    def _base_trade_record(self, ev, countdown_status):
-        return {
-            "datetime": ev.get("datetime", ""),
-            "security": ev.get("security", ""),
-            "setup_completed_at": ev.get("setup_last_dt", ""),
-            "setup_is_perfect": ev.get("setup_perfect", ""),
-            "setup_highest_high": ev.get("setup_highest_high", ""),
-            "count_1_at": ev.get("count_1_dt", ""),
-            "count_2_at": ev.get("count_2_dt", ""),
-            "count_3_at": ev.get("count_3_dt", ""),
-            "count_4_at": ev.get("count_4_dt", ""),
-            "count_5_at": ev.get("count_5_dt", ""),
-            "count_6_at": ev.get("count_6_dt", ""),
-            "count_7_at": ev.get("count_7_dt", ""),
-            "count_8_at": ev.get("count_8_dt", ""),
-            "count_8_close": ev.get("countdown_8_close", ""),
-            "count_9_at": ev.get("count_9_dt", ""),
-            "count_10_at": ev.get("count_10_dt", ""),
-            "count_11_at": ev.get("count_11_dt", ""),
-            "count_12_at": ev.get("count_12_dt", ""),
-            "count_13_at": ev.get("count_13_dt", ""),
-            "countdown_completed_count": ev.get("count", ""),
-            "countdown_is_perfect": ev.get("perfect", ""),
-            "countdown_status": countdown_status,
+            "sell_commission": round(sell_commission_value, 4),
+            "net_pnl": round(net_pnl, 2),
         }
+        self._safe_callback("on_sell_filled", intent, trade, fill, pnl_breakdown)
+
+        if is_terminal_close:
+            self.logger.info(
+                "交易生命周期结束",
+                security=security, sell_reason=intent.sell_reason,
+                sell_qty=int(qty), pnl=round(net_pnl, 2),
+            )
+        else:
+            self.logger.info(
+                "交易部分平仓",
+                security=security, sell_reason=intent.sell_reason,
+                sell_qty=int(qty),
+                remaining_qty=int(original_qty - qty), pnl=round(net_pnl, 2),
+            )
 
     def _record_position_snapshot(self, event, security, trade, dt_text, sell_price="", sell_reason="", pnl=""):
         if self.metadata_recorder is None:
@@ -2066,12 +2757,16 @@ class TradeExecutor:
             "security": security,
             "trade_id": trade.get("_trade_id", ""),
             "open_trade_count": len(self._open_trade_list(security)),
+            "buy_order_id": trade.get("buy_order_id", ""),
             "buy_quantity": trade.get("buy_quantity", ""),
             "buy_price": trade.get("buy_price", ""),
+            "buy_commission": trade.get("buy_commission", ""),
             "entry_value": trade.get("entry_value", ""),
             "stop_loss_price": trade.get("stop_loss_price", ""),
             "take_profit_price": trade.get("take_profit_price", ""),
+            "sell_order_id": trade.get("sell_order_id", ""),
             "sell_price": round(sell_price, 4) if sell_price != "" else "",
+            "sell_commission": trade.get("sell_commission", ""),
             "sell_reason": sell_reason,
             "pnl": round(pnl, 2) if pnl != "" else "",
         }
@@ -2082,19 +2777,6 @@ class TradeExecutor:
         }
         snap.update(port)
         self.metadata_recorder.record_position(snap)
-
-    def _countdown_status(self, ev):
-        ev_type = ev.get("type", "")
-        if "CANCEL" not in ev_type:
-            return COUNTDOWN_STATUS_NORMAL
-        reason = ev.get("reason", "")
-        if reason.startswith("tdst_break_rule_"):
-            return COUNTDOWN_STATUS_CANCEL_TDST_PREFIX + reason.replace("tdst_break_rule_", "")
-        if reason == "opposite_setup":
-            return COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP
-        if reason == "same_setup":
-            return COUNTDOWN_STATUS_CANCEL_SAME_SETUP
-        return "CANCEL_BY_{}".format(str(reason).upper() or "UNKNOWN")
 
     def _open_trade_list(self, security):
         return self.open_trades.get(security, [])
@@ -2136,25 +2818,6 @@ class TradeExecutor:
         if qty <= 0:
             return 0
         return int(qty)
-
-    def _infer_backtest_buy_quantity(self, security, actual_value, fallback_price, before_qty, after_qty):
-        executed = self._safe_float(after_qty) - self._safe_float(before_qty)
-        if executed > 0:
-            return int(executed)
-        price_for_qty = fallback_price if fallback_price > 0 else 0.0
-        qty = int(actual_value / price_for_qty / 100) * 100 if price_for_qty > 0 else 0
-        if qty <= 0:
-            self.logger.info("买入成交数量无法确认", security=security, value=round(actual_value, 2))
-        return qty
-
-    def _infer_backtest_sell_quantity(self, security, fallback_qty, before_qty):
-        # SimTradeLab/PTrade 回测通常同步更新持仓；若能读到下单前后变化，
-        # 以后续成交后的真实持仓差额为准，避免整手/零股调整造成记录漂移。
-        after_qty, _, _ = self._get_position_detail(security)
-        executed = self._safe_float(before_qty) - self._safe_float(after_qty)
-        if executed > 0:
-            return int(executed)
-        return int(fallback_qty)
 
     def _should_exit_by_holding_days(self, holding_days):
         return (
@@ -2291,6 +2954,14 @@ class TradeExecutor:
         return {"total_value": total_value, "available_cash": available_cash, "debug": debug}
 
     def _get_position_detail(self, security):
+        """
+        返回 (qty, market_value, cost_basis_per_share)。
+
+        cost_basis_per_share 优先取 cost_basis（PTrade / SimTradeLab 中即"建仓时的
+        含佣金均价"），buy 路径需要据此推断"本次单笔买入"的真实成本，因此一定要
+        优先取 cost_basis 而不是 last_sale_price——last_sale_price 在 portfolio_value
+        被查询过一次后会被引擎回写为当日收盘价，不能反映本次成交的真实成本。
+        """
         try:
             pos = get_position(security)  # noqa: F821 - PTrade 注入
         except Exception:
@@ -2299,10 +2970,26 @@ class TradeExecutor:
             return 0.0, 0.0, 0.0
         qty = self._first_attr_float(pos, ["current_amount", "total_amount", "enable_amount", "amount", "volume", "qty"])
         value = self._first_attr_float(pos, ["market_value", "position_value", "value", "cost_balance"])
-        price = self._first_attr_float(pos, ["last_sale_price", "price", "cost_basis"])
+        price = self._first_attr_float(pos, ["cost_basis", "cost_price", "avg_cost", "last_sale_price", "price"])
         if price <= 0 and qty > 0 and value > 0:
             price = value / qty
         return qty, value, price
+
+    def _available_cash(self, context):
+        """返回账户当前可用现金。计算 buy / sell 真实成交价的现金端依据。"""
+        portfolio = getattr(context, "portfolio", None)
+        if portfolio is None:
+            return 0.0
+        for name in ("available_cash", "cash", "_cash"):
+            try:
+                if hasattr(portfolio, name):
+                    val = getattr(portfolio, name)
+                    if callable(val):
+                        val = val()
+                    return self._safe_float(val)
+            except Exception:
+                continue
+        return 0.0
 
     def _first_attr_float(self, obj, names):
         for k in names:
@@ -2367,6 +3054,259 @@ class TradeExecutor:
             return bool(is_trade())  # noqa: F821 - PTrade 注入
         except Exception:
             return False
+
+
+# =============================================================================
+# [7.5] 策略适配层：TD 信号 ↔ 交易意图
+# =============================================================================
+#
+# 本层是 TD 9-13 信号与通用 TradeExecutor 之间的桥梁：
+#   1. 把 TD 事件流（COUNTDOWN_COMPLETE / COUNTDOWN_CANCEL / SELL_COUNTDOWN_COMPLETE）
+#      翻译成 BuyIntent / SellIntent，调用 executor.submit_buy / submit_sell；
+#   2. 接收 executor 的成交 / 拒单回调，把它们翻译成 trade.csv 中的 TD 生命周期行；
+#   3. 维护 TD 特有的预检（require_perfect_setup_for_buy）和风控参数
+#      （stop_loss_range_multiple、profit_target_r_multiple）。
+#
+# 交易层（TradeExecutor）完全不依赖本层；理论上只要实现 TradeExecutorCallbacks
+# 接口，任何其他信号体系都能直接复用 TradeExecutor。
+# =============================================================================
+
+COUNTDOWN_STATUS_NORMAL = "NORMAL"
+COUNTDOWN_STATUS_CANCEL_TDST_PREFIX = "CANCEL_BY_TDST_RULE_"
+COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP = "CANCEL_BY_OPPOSITE_SETUP"
+COUNTDOWN_STATUS_CANCEL_SAME_SETUP = "CANCEL_BY_SAME_SETUP"
+
+# TD 特有的买入拒绝原因，仅由本适配层使用。通用拒绝原因
+# （TRADE_DISABLED / INSUFFICIENT_CASH / MIN_TRADE_VALUE / ORDER_REJECTED / ORDER_ERROR）
+# 由 TradeExecutor 给出。
+BUY_REJECT_NON_PERFECT_SETUP = "NON_PERFECT_SETUP"
+
+
+class TDStrategyAdapter(TradeExecutorCallbacks):
+    """
+    TD 9-13 与 TradeExecutor 之间的适配层。
+    `executor` 持有所有交易执行 / 风控逻辑，本类只负责"信号 ↔ 意图 ↔ 终态记录"
+    的翻译。注册到 executor.callbacks 后，所有写 trade.csv 的工作都集中在本类。
+    """
+
+    def __init__(self, executor, trade_recorder, cfg_trade, logger):
+        self.executor = executor
+        self.trade_recorder = trade_recorder
+        self.logger = logger
+        # TD 特有风控参数；通用风控参数（stop_loss_enabled / max_holding_days*）留在 executor
+        self.profit_target_r_multiple = float(cfg_trade.get("profit_target_r_multiple", 1.5))
+        self.stop_loss_range_multiple = float(cfg_trade.get("stop_loss_range_multiple", 1.0))
+        self.require_perfect_setup_for_buy = bool(cfg_trade.get("require_perfect_setup_for_buy", False))
+        self.take_profit_on_sell_countdown = bool(cfg_trade.get("take_profit_on_sell_countdown", False))
+        # 注册回调
+        executor.set_callbacks(self)
+
+    # ---------- 信号 → 意图 ----------
+    def execute_for_events(self, context, security, last_bar_events):
+        if not last_bar_events:
+            return
+        for ev in last_bar_events:
+            if ev.get("category") != "COUNTDOWN":
+                continue
+            ev_type = ev.get("type", "")
+            direction = int(ev.get("direction", 0))
+
+            # Buy countdown 取消：生命周期在"计数取消"处结束，写一行 trade.csv。
+            if direction == 1 and ev_type == "BUY_COUNTDOWN_CANCEL":
+                self._write_terminal_row(
+                    ev, bought=False, buy_reject_reason="",
+                    countdown_status=self._countdown_status(ev),
+                )
+                continue
+
+            # Buy countdown 完成：经预检后构造 BuyIntent 投递交易层。
+            if direction == 1 and ev_type.startswith("BUY_COUNTDOWN_COMPLETE"):
+                self._dispatch_buy(context, security, ev)
+                continue
+
+            # Sell countdown 完成：仅当配置启用且仓位盈利时主动趋势反转止盈。
+            if direction == -1 and ev_type.startswith("SELL_COUNTDOWN_COMPLETE"):
+                self._dispatch_sell_countdown(context, security, ev)
+
+    def _dispatch_buy(self, context, security, ev):
+        # TD 特有预检放在交易层之外
+        if self.require_perfect_setup_for_buy and not _boolish(ev.get("setup_perfect")):
+            self._write_terminal_row(
+                ev, bought=False, buy_reject_reason=BUY_REJECT_NON_PERFECT_SETUP,
+            )
+            return
+        intent = BuyIntent(
+            security=security,
+            target_value=0.0,  # 实际目标金额由 executor 按 buy_fraction 计算
+            decision_dt=_format_dt(self.executor._current_dt(context)),
+            fallback_price=_safe_float(ev.get("bar_close")),
+            metadata={"td_event": ev},
+        )
+        self.executor.submit_buy(context, intent)
+
+    def _dispatch_sell_countdown(self, context, security, ev):
+        if not self.take_profit_on_sell_countdown:
+            return
+        trades = self.executor.open_trades.get(security, [])
+        if not trades:
+            return
+        ref_price = _safe_float(ev.get("bar_close"))
+        for trade in list(trades):
+            buy_price = _safe_float(trade.get("buy_price"))
+            if ref_price <= buy_price:
+                self.logger.info(
+                    "Sell Countdown 出现但该笔仓位未盈利，不做趋势反转止盈",
+                    security=security, trade_id=trade.get("_trade_id"),
+                    ref_price=round(ref_price, 4), buy_price=round(buy_price, 4),
+                )
+                continue
+            self.executor.submit_sell(context, SellIntent(
+                security=security, trade=trade,
+                sell_reason=SELL_REASON_TREND_REVERSAL,
+                fallback_price=ref_price,
+                metadata={"td_event": ev},
+            ))
+
+    # ---------- 交易层 → trade.csv 终态行 ----------
+    def on_buy_rejected(self, intent, reason):
+        ev = intent.metadata.get("td_event", {})
+        self._write_terminal_row(ev, bought=False, buy_reject_reason=reason)
+
+    def on_buy_filled(self, intent, trade, fill):
+        """根据真实成交价反算止损 / 止盈，并把 TD 信号上下文存入 trade 对象。"""
+        ev = intent.metadata.get("td_event", {})
+        stop_loss, take_profit = self._calc_td_risk_prices(ev, fill.price)
+        trade["stop_loss_price"] = round(stop_loss, 4) if stop_loss else ""
+        trade["take_profit_price"] = round(take_profit, 4) if take_profit else ""
+        # 把生成 trade.csv 终态行所需的 TD 字段全部缓存下来；
+        # 交易层完全不会读取 _strategy_metadata。
+        trade["_strategy_metadata"] = {
+            "td_event": dict(ev),
+        }
+
+    def on_sell_filled(self, intent, trade, fill, pnl_breakdown):
+        td_ctx = (trade.get("_strategy_metadata") or {}).get("td_event", {})
+        row = self._base_lifecycle_row(td_ctx, COUNTDOWN_STATUS_NORMAL)
+        row.update({
+            "datetime": fill.fill_dt,
+            "bought": True,
+            "buy_reject_reason": "",
+            "buy_order_id": trade.get("buy_order_id", ""),
+            "buy_quantity": pnl_breakdown["sold_qty"],
+            "buy_price": pnl_breakdown["buy_price"],
+            "buy_commission": pnl_breakdown["buy_commission_for_qty"],
+            "buy_date": trade.get("buy_date", ""),
+            "entry_value": pnl_breakdown["entry_value"],
+            "stop_loss_price": trade.get("stop_loss_price", ""),
+            "take_profit_price": trade.get("take_profit_price", ""),
+            "sell_order_id": fill.order_id,
+            "sell_price": round(fill.price, 4),
+            "sell_commission": pnl_breakdown["sell_commission"],
+            "sell_date": fill.fill_dt,
+            "sell_reason": intent.sell_reason,
+            "price_pnl": pnl_breakdown["price_pnl"],
+            "dividend_income": pnl_breakdown["dividend_income"],
+            "pnl": pnl_breakdown["net_pnl"],
+        })
+        if self.trade_recorder is not None:
+            self.trade_recorder.record(row)
+
+    def on_sell_rejected(self, intent, reason):
+        # 卖出未达成不写 trade.csv 终态——仓位继续保留，下一周期由风控再尝试。
+        # 此处只记一条复盘日志，方便事后定位"为什么 TD 信号触发了卖单却没成交"。
+        self.logger.info(
+            "卖出意图被交易层拒绝",
+            security=intent.security, sell_reason=intent.sell_reason, reason=reason,
+        )
+
+    def on_position_adjusted(self, security, trade, dt_text, ratio, reason):
+        # 由 executor 处理日志和 position_snapshot ADJUST 行，本层无需额外动作。
+        pass
+
+    # ---------- TD-specific 内部工具 ----------
+    def _calc_td_risk_prices(self, ev, buy_price):
+        low = _safe_float(ev.get("countdown_low"))
+        high = _safe_float(ev.get("countdown_low_bar_high"))
+        if low <= 0 or high <= 0 or high < low:
+            return "", ""
+        raw_stop_loss = low - (high - low) * self.stop_loss_range_multiple
+        take_profit = buy_price + (buy_price - raw_stop_loss) * self.profit_target_r_multiple
+        stop_loss = raw_stop_loss if self.executor.stop_loss_enabled else ""
+        return stop_loss, take_profit
+
+    def _write_terminal_row(self, ev, bought=False, buy_reject_reason="", countdown_status=None):
+        if self.trade_recorder is None:
+            return
+        status = countdown_status or self._countdown_status(ev)
+        row = self._base_lifecycle_row(ev, status)
+        row.update({
+            "datetime": ev.get("datetime", ""),
+            "bought": bool(bought),
+            "buy_reject_reason": buy_reject_reason,
+            "buy_order_id": "", "buy_quantity": "", "buy_price": "",
+            "buy_commission": "", "buy_date": "",
+            "entry_value": "", "stop_loss_price": "", "take_profit_price": "",
+            "sell_order_id": "", "sell_price": "", "sell_commission": "",
+            "sell_date": "", "sell_reason": "",
+            "price_pnl": "", "dividend_income": "", "pnl": "",
+        })
+        self.trade_recorder.record(row)
+
+    @staticmethod
+    def _base_lifecycle_row(ev, countdown_status):
+        return {
+            "datetime": ev.get("datetime", ""),
+            "security": ev.get("security", ""),
+            "setup_completed_at": ev.get("setup_last_dt", ""),
+            "setup_is_perfect": ev.get("setup_perfect", ""),
+            "setup_highest_high": ev.get("setup_highest_high", ""),
+            "count_1_at": ev.get("count_1_dt", ""),
+            "count_2_at": ev.get("count_2_dt", ""),
+            "count_3_at": ev.get("count_3_dt", ""),
+            "count_4_at": ev.get("count_4_dt", ""),
+            "count_5_at": ev.get("count_5_dt", ""),
+            "count_6_at": ev.get("count_6_dt", ""),
+            "count_7_at": ev.get("count_7_dt", ""),
+            "count_8_at": ev.get("count_8_dt", ""),
+            "count_8_close": ev.get("countdown_8_close", ""),
+            "count_9_at": ev.get("count_9_dt", ""),
+            "count_10_at": ev.get("count_10_dt", ""),
+            "count_11_at": ev.get("count_11_dt", ""),
+            "count_12_at": ev.get("count_12_dt", ""),
+            "count_13_at": ev.get("count_13_dt", ""),
+            "countdown_completed_count": ev.get("count", ""),
+            "countdown_is_perfect": ev.get("perfect", ""),
+            "countdown_status": countdown_status,
+        }
+
+    @staticmethod
+    def _countdown_status(ev):
+        ev_type = ev.get("type", "")
+        if "CANCEL" not in ev_type:
+            return COUNTDOWN_STATUS_NORMAL
+        reason = ev.get("reason", "")
+        if reason.startswith("tdst_break_rule_"):
+            return COUNTDOWN_STATUS_CANCEL_TDST_PREFIX + reason.replace("tdst_break_rule_", "")
+        if reason == "opposite_setup":
+            return COUNTDOWN_STATUS_CANCEL_OPPOSITE_SETUP
+        if reason == "same_setup":
+            return COUNTDOWN_STATUS_CANCEL_SAME_SETUP
+        return "CANCEL_BY_{}".format(str(reason).upper() or "UNKNOWN")
+
+
+def _safe_float(value):
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _boolish(x):
+    if isinstance(x, bool):
+        return x
+    return x is True or str(x).lower() in ("true", "1", "yes")
 
 
 # =============================================================================
@@ -2580,6 +3520,19 @@ def initialize(context):
     bt_cfg = cfg["backtest"]
     set_slippage(slippage=float(bt_cfg["slippage"]))  # noqa: F821
     set_limit_mode(bt_cfg["limit_mode"])  # noqa: F821
+    # 同步把 commission 配置交给 PTrade 引擎；TradeExecutor 自算时会读同一份配置，
+    # 这样 trade.csv 中的 buy_commission/sell_commission 与 PTrade 实际扣款保持一致。
+    commission_ratio_cfg = float(bt_cfg["commission_ratio"])
+    min_commission_cfg = float(bt_cfg["min_commission"])
+    try:
+        set_commission(  # noqa: F821 - PTrade 注入；SimTradeLab 也提供等价实现
+            commission_ratio=commission_ratio_cfg,
+            min_commission=min_commission_cfg,
+            type="STOCK",
+        )
+    except Exception as exc:
+        # 个别 SimTradeLab 版本不支持该 API，不视为致命：策略内部仍按配置自算。
+        g.logger.warning("set_commission 调用失败，已使用配置自算手续费", err=str(exc))
 
     # (5) 数据层
     data_cfg = cfg["data"]
@@ -2602,12 +3555,20 @@ def initialize(context):
         logger=g.logger,
         enabled=log_cfg.get("csv_output", True),
     )
-    # (7) 交易执行层
+    # (7) 交易执行层（通用，不感知 TD 信号）
     g.trade_executor = TradeExecutor(
         cfg_trade=cfg["trade"],
         logger=g.logger,
-        trade_recorder=g.trade_recorder,
         metadata_recorder=g.recorder,
+        commission_ratio=commission_ratio_cfg,
+        min_commission=min_commission_cfg,
+    )
+    # (7.1) 策略适配层：把 TD 信号 ↔ 通用 Buy/Sell 意图，并独占 trade.csv 写入
+    g.trade_adapter = TDStrategyAdapter(
+        executor=g.trade_executor,
+        trade_recorder=g.trade_recorder,
+        cfg_trade=cfg["trade"],
+        logger=g.logger,
     )
 
     # (8) 当日有效（非停牌）标的列表，由 before_trading_start 每日刷新
@@ -2669,6 +3630,12 @@ def handle_data(context, data):
         3. 筛出"最后一根 K 线（= 昨日）"产生的信号事件——这些是今天可以执行的信号
         4. 交易层基于这些信号在今日下单；事件写入根目录 td_events.csv
     """
+    # (0) 在当周期任何下单 / 风控逻辑前，先把"上周期下出去、PTrade 后续才撮合成交"
+    # 的订单按真实成交回报落账到 trade.csv / position_snapshot.csv，
+    # 这样后续 check_backtest_exits / accrue_dividends 看到的是与 PTrade 完全
+    # 一致的持仓 / 成本 / 风控价。
+    g.trade_executor.reconcile_pending_orders(context)
+
     all_today_events = []
     skipped_halt = 0
     skipped_data = 0
@@ -2723,8 +3690,8 @@ def handle_data(context, data):
             for ev in last_bar_events:
                 if _should_track_event_outcome(ev):
                     g.pending_event_outcomes.setdefault(security, []).append(dict(ev))
-            # (5) 交易层：按"昨日信号 → 今日下单"的时序执行
-            g.trade_executor.execute_for_events(
+            # (5) 策略适配层：把 TD 事件翻译为通用 Buy/Sell 意图投递给交易层
+            g.trade_adapter.execute_for_events(
                 context=context,
                 security=security,
                 last_bar_events=last_bar_events,
@@ -2737,6 +3704,11 @@ def handle_data(context, data):
         g.logger.info("本周期 TD 事件", count=len(all_today_events))
     if skipped_halt or skipped_data:
         g.logger.debug("本周期跳过标的", halt=skipped_halt, insufficient_data=skipped_data)
+
+    # (7) 周期末再 reconcile 一次，捕获 SimTradeLab 等同步撮合引擎在本 cycle
+    # 内即时成交的订单，使 trade.csv 不会被推迟一周期。对于真正异步的 PTrade
+    # 引擎，这次 reconcile 通常只会看到"未成交"或"刚成交"的同一份状态——幂等。
+    g.trade_executor.reconcile_pending_orders(context)
 
 
 def tick_data(context, data):
