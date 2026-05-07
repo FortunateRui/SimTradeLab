@@ -1,0 +1,75 @@
+{
+    "_comment": "抽取5支股票进行5年的回测，滑点为0，佣金费率0.03%，单笔最低佣金5元，验证simtradelab和PTrade的一致性，并在论文中做相关的补充",
+    "universe": {
+        "securities": [
+            "600519.SS",
+            "000858.SZ",
+            "601318.SS",
+            "600036.SS",
+            "000651.SZ"
+          ],
+        "benchmark": "000300.SS"
+    },
+
+    "data": {
+        "frequency": "1d",
+        "fq": "pre",
+        "lookback_count": 200,
+        "min_required_bars": 120
+    },
+
+    "backtest": {
+        "slippage": 0,
+        "limit_mode": "UNLIMITED",
+        "_commission_ratio_comment": "佣金费率（含经手费由 PTrade 引擎自动按万分之0.487计；印花税仅卖出按千分之1计）。策略也按此费率自算 trade.csv 中的手续费。",
+        "commission_ratio": 0.0003,
+        "_min_commission_comment": "单笔最低佣金，与 PTrade set_commission 同义。",
+        "min_commission": 5.0
+    },
+
+    "setup": {
+        "require_perfect_for_signal": false
+    },
+
+    "intersection": {
+        "_reserved": "TD 交叉规则（Intersection），后续更新中加入此功能",
+        "enabled": false
+    },
+
+    "countdown": {
+        "enabled": true,
+        "type": "sequence",
+        "require_perfect": false,
+        "tdst_cancel_rule": 4,
+        "cancel_on_opposite_setup": true,
+        "cancel_on_same_setup": true,
+        "_reserved_combo": "组合型 Countdown（Combo），后续更新中加入此功能",
+        "_reserved_recycle": "Recycle（循环计数）规则，后续更新中加入此功能",
+        "_reserved_termination": "TD Termination Count（TD 终结计数），后续更新中加入此功能"
+    },
+
+    "trade": {
+        "enabled": true,
+        "buy_fraction_of_portfolio": 0.01,
+        "min_trade_value": 1000,
+        "min_cash_for_buy": 1000,
+        "take_profit_on_sell_countdown": true,
+        "stop_loss_enabled": true,
+        "stop_loss_range_multiple": 1.0,
+        "profit_target_r_multiple": 1.5,
+        "require_perfect_setup_for_buy": false,
+        "max_holding_days_enabled": true,
+        "max_holding_days": 400,
+        "_pending_order_timeout_days_comment": "挂单 N 个自然日仍未拿到 PTrade 终态时主动 cancel_order（软超时）。<=0 关闭",
+        "pending_order_timeout_days": 5,
+        "_pending_order_force_drop_days_comment": "撤单后再过 N 个自然日还没消化时强制摘除 pending 项并触发 TIMEOUT 拒绝回调（硬超时）。<=0 关闭",
+        "pending_order_force_drop_days": 30
+    },
+
+    "log": {
+        "level": "INFO",
+        "verbose_state_transition": false,
+        "verbose_countdown_step": true,
+        "csv_output": true
+    }
+}
