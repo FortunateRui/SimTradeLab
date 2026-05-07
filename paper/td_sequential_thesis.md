@@ -10,7 +10,7 @@
 <br>
 **关键词**  DeMarker指标  TD序列  量化交易  有限状态机  适用性分析
 
-# Design and Implementation of a Quantitative Trading System Based on the DeMarker Indicator
+# Design and Implementation of Quantitative Trading System Based on DeMarker Indicator
 
 ## ABSTRACT
 
