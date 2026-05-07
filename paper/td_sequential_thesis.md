@@ -248,7 +248,7 @@ TDST 阈值提供五种规则配置。以 Buy Countdown 为例，规则可选择
 
 系统按"配置—数据—信号—适配—执行—输出—钩子"的纵向流与"通用交易层与策略适配层"的横向解耦组织。除策略钩子层之外，其余各层均以纯计算或纯 IO 类的形式存在，不直接调用 PTrade API；策略钩子层负责把这些类组装到 PTrade 的 `initialize`、`before_trading_start`、`handle_data`、`tick_data`、`on_trade_response` 与 `after_trading_end` 生命周期中。系统分层架构与跨层调用关系如图4-1所示。
 
-![系统分层架构图](figures/fig-4-1-architecture.png)
+![系统分层架构图](figures/architecture.png)
 
 图4-1  系统分层架构图
 
@@ -264,11 +264,7 @@ TDST 阈值提供五种规则配置。以 Buy Countdown 为例，规则可选择
 | 输出与元数据层 | `MetadataRecorder`、`TradeRecordRecorder` | 写入 `td_events.csv`、`event_outcomes.csv`、`position_snapshot.csv` 与 `trade.csv` |
 | 策略钩子层 | `initialize`、`before_trading_start`、`handle_data`、`tick_data`、`on_trade_response`、`after_trading_end` | 在 PTrade 允许的钩子内编排上述各层 |
 
-类间依赖与外部接口的边界如图4-2所示。可以观察到，信号层只依赖 `Bar` 序列，与 PTrade API 完全解耦；通用交易执行层向上接受 `BuyIntent` 与 `SellIntent`，向下与 PTrade 或 SimTradeLab API 通信，与具体信号语义无关。这种结构使得若未来研究者改用均线、布林带或机器学习信号，仅需替换信号层与策略适配层，交易执行、对账、超时与除权除息等通用机制可全部复用。
-
-![模块依赖关系图](figures/fig-4-2-module-deps.png)
-
-图4-2  模块依赖关系图
+从模块依赖角度看，信号层只依赖 `Bar` 序列，与 PTrade API 完全解耦；通用交易执行层向上接受 `BuyIntent` 与 `SellIntent`，向下与 PTrade 或 SimTradeLab API 通信，与具体信号语义无关。这种结构使得若未来研究者改用均线、布林带或机器学习信号，仅需替换信号层与策略适配层，交易执行、对账、超时与除权除息等通用机制可全部复用。
 
 ### 4.3 关键功能模块设计
 
@@ -276,11 +272,7 @@ TDST 阈值提供五种规则配置。以 Buy Countdown 为例，规则可选择
 
 `MetadataRecorder` 与 `TradeRecordRecorder` 共同负责输出层。前者写入 `td_events.csv`、`event_outcomes.csv` 与 `position_snapshot.csv`，三者均按时间顺序追加；后者写入 `<SEC>/trade.csv` 与运行根目录下的汇总 `trade.csv`，仅在生命周期终态新增一行。两类记录器使用统一的表头并通过首行检测决定是否补写表头，便于不同运行批次之间的合并与对比。
 
-`TDStrategyAdapter` 是 TD 信号与通用交易意图之间的桥梁，与 `TradeExecutor` 通过四个数据对象与五个回调方法通信，模块职责与契约关系如图4-3所示。该适配层保留 TD 特有的预检逻辑（如 `require_perfect_setup_for_buy`）与风控参数（`stop_loss_range_multiple`、`profit_target_r_multiple`、`take_profit_on_sell_countdown`），并独占 `trade.csv` 的写入。
-
-![模块职责与契约关系图](figures/fig-4-3-responsibility.png)
-
-图4-3  模块职责与契约关系图
+`TDStrategyAdapter` 是 TD 信号与通用交易意图之间的桥梁，与 `TradeExecutor` 通过 `BuyIntent`、`SellIntent`、`FillInfo` 三个数据对象以及 `TradeExecutorCallbacks` 中的 `on_buy_filled`、`on_buy_rejected`、`on_sell_filled`、`on_sell_rejected`、`on_position_adjusted` 五个回调方法通信，"意图下发"与"成交回报"在方向上严格分离，符合命令查询职责分离原则。该适配层保留 TD 特有的预检逻辑（如 `require_perfect_setup_for_buy`）与风控参数（`stop_loss_range_multiple`、`profit_target_r_multiple`、`take_profit_on_sell_countdown`），并独占 `trade.csv` 的写入。
 
 `TradeExecutor` 对外暴露 9 个公开方法，包括 `submit_buy`、`submit_sell`、`reconcile_pending_orders`、`check_backtest_exits`、`check_tick_exits`、`accrue_dividends`、`reconcile_position_adjustments`、`on_trade_response` 与 `set_callbacks`，覆盖订单提交、跨周期对账、回测与实盘风控触发、分红累计、除权送股同步以及外部成交回报响应六类职责。该模块对外暴露稳定接口、对内封装与 PTrade 或 SimTradeLab API 的字段差异，体现了开闭原则在策略系统中的应用[^25]。
 
@@ -306,51 +298,43 @@ TDST 阈值提供五种规则配置。以 Buy Countdown 为例，规则可选择
 
 数据层的主要任务是把外部行情接口产出的原始数据转换为按时间升序排列、剔除无效成交日的 `Bar` 序列，输入到信号层。`MarketDataFetcher` 通过 `get_history(count=lookback_count, include=False)` 获取 K 线，其中 `include=False` 保证最后一根 K 线为已收盘 K 线。该约定使得日线策略中"信号基于昨日收盘后可确认的信息生成、订单在今日盘中执行"的时序成立，避免使用未来数据。
 
-A 股市场存在停牌、退市风险与新股上市初期价格异常等情况，本系统采用三层停牌过滤防护：盘前由 `before_trading_start` 调用 `filter_stock_by_status(["HALT","DELISTING"])` 剔除当日停牌或退市标的；盘中由 `handle_data` 调用 `get_stock_status('HALT', today)` 进行二次复核；历史数据层则直接丢弃 `volume<=0` 的 K 线，使 Setup 与 Countdown 状态机接收的永远是连续的有效成交日序列。数据层处理流程如图4-4所示。
-
-![数据层处理流程图](figures/fig-4-4-data-pipeline.png)
-
-图4-4  数据层处理流程图
+A 股市场存在停牌、退市风险与新股上市初期价格异常等情况，本系统采用三层停牌过滤防护：盘前由 `before_trading_start` 调用 `filter_stock_by_status(["HALT","DELISTING"])` 剔除当日停牌或退市标的；盘中由 `handle_data` 调用 `get_stock_status('HALT', today)` 进行二次复核；历史数据层则直接丢弃 `volume<=0` 的 K 线，使 Setup 与 Countdown 状态机接收的永远是连续的有效成交日序列。
 
 复权口径方面系统采用前复权全量重算策略。每个交易周期内 `MarketDataFetcher` 重新拉取 `lookback_count` 根前复权 K 线，状态机从头计算事件流，避免长期缓存与新发生的权益事件之间出现复权因子不一致的问题。该处理对应第二章关于"前复权加每日全量重算"的论述，并把信号识别口径与交易执行口径在系统层面解耦。
 
 ### 4.6 单周期主流程设计
 
-`handle_data` 是系统在每个交易周期被调用一次的主流程入口，也是系统健壮性最关键的部分。流程按"先落账、再决策、最后再落账"的顺序组织，共分为七步：周期开始时调用 `reconcile_pending_orders` 结算上周期未结成交；遍历当日有效标的并复核停牌；对每只标的获取并清洗 K 线；更新事件窗口结果，使成熟事件落入 `event_outcomes.csv`；同步当日除权送股与现金分红；调用风控触发器检查止损止盈；运行 TD 信号处理器并将事件交付策略适配层提交订单；周期末再次调用 `reconcile_pending_orders`，捕获 SimTradeLab 同步撮合下本周期内即可结算的订单。完整流程如图4-5所示。
+`handle_data` 是系统在每个交易周期被调用一次的主流程入口，也是系统健壮性最关键的部分。流程按"先落账、再决策、最后再落账"的顺序组织，共分为七步：周期开始时调用 `reconcile_pending_orders` 结算上周期未结成交；遍历当日有效标的并复核停牌；对每只标的获取并清洗 K 线；更新事件窗口结果，使成熟事件落入 `event_outcomes.csv`；同步当日除权送股与现金分红；调用风控触发器检查止损止盈；运行 TD 信号处理器并将事件交付策略适配层提交订单；周期末再次调用 `reconcile_pending_orders`，捕获 SimTradeLab 同步撮合下本周期内即可结算的订单。完整流程如图4-2所示。
 
-![单周期主流程图](figures/fig-4-5-handle-data.png)
+![单周期主流程图](figures/handle-data.png)
 
-图4-5  单周期 handle\_data 主流程图
+图4-2  单周期 handle\_data 主流程图
 
 该顺序的设计依据可归纳为四点。第一，上周期的成交回报必须先被结算到 `open_trades` 与 `position_snapshot.csv` 中，否则风控触发器看到的是过期持仓；第二，分红与送股引起的数量、止损价与止盈价同步必须先于风控触发，否则止损价可能在除权日错误命中；第三，信号识别本身不依赖持仓状态，因此放在最后执行；第四，周期末再次对账可使 SimTradeLab 同步撮合下本周期内的成交立即落入 `trade.csv`，避免一律延后到下一周期。
 
-信号产生与下单执行之间的时序关系如图4-6所示。`include=False` 决定了信号事件的 `datetime` 永远等于上一交易日；交易层基于这些"昨日新鲜信号"在今日盘中下单；订单的真实成交结果需要等到 PTrade 异步撮合返回 `business_price` 与 `business_amount` 之后才被写入 `trade.csv` 终态行，避免回测中的预估 PnL 与引擎实际扣账不一致。
+信号产生与下单执行之间的时序关系如图4-3所示。`include=False` 决定了信号事件的 `datetime` 永远等于上一交易日；交易层基于这些"昨日新鲜信号"在今日盘中下单；订单的真实成交结果需要等到 PTrade 异步撮合返回 `business_price` 与 `business_amount` 之后才被写入 `trade.csv` 终态行，避免回测中的预估 PnL 与引擎实际扣账不一致。
 
-![信号下单成交时序图](figures/fig-4-6-signal-order-sequence.png)
+![信号下单成交时序图](figures/signal-order-sequence.png)
 
-图4-6  信号下单成交时序图
+图4-3  信号下单成交时序图
 
 ### 4.7 信号、订单与仓位的生命周期建模
 
 系统在三个不同尺度上建立了显式的生命周期模型：信号尺度的 Setup 与 Countdown 状态、订单尺度的提交至撮合至终结、以及仓位尺度的开仓至调整至平仓。三类生命周期相互独立、相互配合，分别对应 FR3 至 FR4、FR6 至 FR7 与 NFR1。
 
-信号生命周期由 `SetupMachine`、`CountdownMachine` 与 `TDSignalProcessor` 构成的事件流驱动。Setup 状态机要求严格连续的 9 根 K 线计数，可在反向输入或相等输入下被中断或重启；Countdown 状态机允许非连续计数，在配置 `require_perfect=true` 且计数为 12 时支持 `PLUS_TENTATIVE` 暂记态，并在 TDST 突破、反向 Setup 或同向新 Setup 下转入 `CANCEL` 终态。综合的信号生命周期状态如图4-7所示。
+信号生命周期由 `SetupMachine`、`CountdownMachine` 与 `TDSignalProcessor` 构成的事件流驱动。Setup 状态机要求严格连续的 9 根 K 线计数，可在反向输入或相等输入下被中断或重启；Countdown 状态机允许非连续计数，在配置 `require_perfect=true` 且计数为 12 时支持 `PLUS_TENTATIVE` 暂记态，并在 TDST 突破、反向 Setup 或同向新 Setup 下转入 `CANCEL` 终态。综合的信号生命周期状态如图4-4所示。
 
-![信号生命周期状态图](figures/fig-4-7-signal-lifecycle.png)
+![信号生命周期状态图](figures/signal-lifecycle.png)
 
-图4-7  TD 信号生命周期状态图
+图4-4  TD 信号生命周期状态图
 
-订单生命周期在通用交易执行层中由 `pending_buy_orders` 与 `pending_sell_orders` 两个队列维护。订单提交后进入 `Pending` 状态，由 `reconcile_pending_orders` 通过 `get_order(order_id)` 与 `get_trades(security)` 接口轮询真实成交；部分成交、全部成交、引擎主动撤单与跨日未成交分别走不同终态分支。为防止极端情况下订单挂起阻塞后续止损，系统设置了软超时 `pending_order_timeout_days` 与硬超时 `pending_order_force_drop_days` 两阶段保护，对应 NFR3 与 NFR6 的稳定性要求。订单生命周期如图4-8所示。
+订单生命周期在通用交易执行层中由 `pending_buy_orders` 与 `pending_sell_orders` 两个队列维护。订单提交后进入 `Pending` 状态，由 `reconcile_pending_orders` 通过 `get_order(order_id)` 与 `get_trades(security)` 接口轮询真实成交；部分成交、全部成交、引擎主动撤单与跨日未成交分别走不同终态分支。为防止极端情况下订单挂起阻塞后续止损，系统设置了软超时 `pending_order_timeout_days` 与硬超时 `pending_order_force_drop_days` 两阶段保护，对应 NFR3 与 NFR6 的稳定性要求。订单生命周期如图4-5所示。
 
-![订单生命周期状态图](figures/fig-4-8-order-lifecycle.png)
+![订单生命周期状态图](figures/order-lifecycle.png)
 
-图4-8  订单生命周期状态图
+图4-5  订单生命周期状态图
 
-仓位生命周期以 `_trade_id` 为唯一标识，每笔仓位独立追踪止损价、止盈价、最大持仓天数与分红归属。仓位在送股、转增或账户兜底校验出现差额时进入 `ADJUST` 中间状态，在该状态下系统按比例同步剩余数量、买入价、止损价与止盈价，并在 `position_snapshot.csv` 写入 `ADJUST` 行，但不写入 `trade.csv`，以保持 `trade.csv` 仅记录终态的不变量。仓位生命周期如图4-9所示。
-
-![仓位生命周期状态图](figures/fig-4-9-position-lifecycle.png)
-
-图4-9  仓位生命周期状态图
+仓位生命周期以 `_trade_id` 为唯一标识，每笔仓位独立追踪止损价、止盈价、最大持仓天数与分红归属。仓位在送股、转增或账户兜底校验出现差额时进入 `ADJUST` 中间状态，在该状态下系统按比例同步剩余数量、买入价、止损价与止盈价，并在 `position_snapshot.csv` 写入 `ADJUST` 行，但不写入 `trade.csv`，以保持 `trade.csv` 仅记录终态的不变量。
 
 ### 4.8 交易执行层与策略适配层的解耦设计
 
@@ -417,11 +401,7 @@ A 股市场存在停牌、退市风险与新股上市初期价格异常等情况
 
 ### 4.11 本地模拟环境一致性验证
 
-第 4.6 节明确了 SimTradeLab 是大规模回测的主要执行环境，4.10 节给出了异常处理与可扩展性边界。在用 SimTradeLab 替代 PTrade 进行长周期回测之前，仍需验证两套环境在关键行为上的一致性。本节给出小样本一致性验证方法，以 5 只样本股票（600519.SS、000858.SZ、601318.SS、600036.SS 与 000651.SZ）、2016-01-01 至 2021-01-01 共五个完整交易年度作为样本区间，复权方式为前复权，初始资金 1,000,000 元，单笔仓位为总资产的 1%，滑点为 0、佣金费率 0.03%、最低佣金 5 元，TDST 采用默认规则 4，Buy Countdown 完成后允许直接买入，Sell Countdown 完成在仓位盈利时作为趋势反转止盈。完整对账流程如图4-10所示。
-
-![一致性验证对账流程图](figures/fig-4-10-consistency-flow.png)
-
-图4-10  一致性验证对账流程图
+第 4.6 节明确了 SimTradeLab 是大规模回测的主要执行环境，4.10 节给出了异常处理与可扩展性边界。在用 SimTradeLab 替代 PTrade 进行长周期回测之前，仍需验证两套环境在关键行为上的一致性。本节给出小样本一致性验证方法，以 5 只样本股票（600519.SS、000858.SZ、601318.SS、600036.SS 与 000651.SZ）、2016-01-01 至 2021-01-01 共五个完整交易年度作为样本区间，复权方式为前复权，初始资金 1,000,000 元，单笔仓位为总资产的 1%，滑点为 0、佣金费率 0.03%、最低佣金 5 元，TDST 采用默认规则 4，Buy Countdown 完成后允许直接买入，Sell Countdown 完成在仓位盈利时作为趋势反转止盈。
 
 对账以 4.9 节提到的四类输出文件为基础，按"信号、事件研究、交易生命周期、仓位过程"四层递进。两套环境运行结束后所有输出文件的样本数量完全一致，且关键路径——包括事件类型、Setup 与 Countdown 计数、取消原因、Buy Countdown 完成日期、买入与卖出交易日、退出原因、止损价与止盈价主体以及分红收益——也完全一致。对账结果如表4-7所示。
 
