@@ -1,0 +1,21 @@
+{
+  "name": "simtradelab",
+  "version": "1.0.0",
+  "description": "**轻量级量化回测框架 - PTrade API本地实现**",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.10",
+    "docx": "^9.6.1",
+    "jszip": "^3.10.1"
+  }
+}
