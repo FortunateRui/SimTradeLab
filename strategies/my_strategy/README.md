@@ -195,3 +195,16 @@ Countdown[13].Close >= Countdown[8].Close
 - [ ] 图片的字太小，内容紧凑点
 - [ ] 第六章列点描述，看起来清晰一点
 - [ ] 6.2标题
+
+
+以000720.SZ分析，2017-10-27当天完成的完整交易：
+datetime	security	setup_completed_at	setup_is_perfect	setup_highest_high	count_1_at	count_2_at	count_3_at	count_4_at	count_5_at	count_6_at	count_7_at	count_8_at	count_8_close	count_9_at	count_10_at	count_11_at	count_12_at	count_13_at	countdown_completed_count	countdown_is_perfect	countdown_status	bought	buy_reject_reason	buy_order_id	buy_quantity	buy_price	buy_commission	buy_date	entry_value	stop_loss_price	take_profit_price	sell_order_id	sell_price	sell_commission	sell_date	sell_reason	price_pnl	dividend_income	pnl
+2017-10-27 00:00:00	000720.SZ	2017-04-20 00:00:00	TRUE	6.16	2017-04-20 00:00:00	2017-04-24 00:00:00	2017-04-25 00:00:00	2017-05-04 00:00:00	2017-05-05 00:00:00	2017-05-08 00:00:00	2017-05-09 00:00:00	2017-05-10 00:00:00	4.9	2017-05-23 00:00:00	2017-05-24 00:00:00	2017-06-01 00:00:00	2017-06-14 00:00:00	2017-06-21 00:00:00	13	FALSE	NORMAL	TRUE		0d48ab2701774bf2918c1a114ea8dc94	2000	5.0125	5.4882	2017-06-22 00:00:00	10025.0	4.41	5.9163	db59d33de5914378896c605640e65dcc	5.2874	16.0897	2017-10-27 00:00:00	PROFIT_TARGET	549.71	0.0	528.13
+
+
+
+count11 low 4.66 high 4.91
+购买价 = 5.0125
+差值 = 4.91-4.66 = 0.25
+止损 = 4.66-0.25*1.0 = 4.41
+止盈 = 5.0125+(5.0125-4.41)*1.5 = 5.91625
