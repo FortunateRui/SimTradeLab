@@ -84,6 +84,11 @@ APPLY_PRE_ADJ = True
 # 4) 输出目录（脚本同级 check_output/<security>_<sell_date>.png）
 OUTPUT_DIR_NAME = "check_output"
 
+# 5) 批量模式：当 BATCH_TRADE_CSV 非空时，自动读取该 trade.csv，对每条已平仓行
+#    （bought=True 且 sell_date 非空）各画一张图，忽略 TARGET_TRADE 配置。
+#    路径可写相对脚本的相对路径或绝对路径。
+BATCH_TRADE_CSV = "../research_path/2016-01-01_1/000720SZ/trade.csv"
+
 
 # =============================================================================
 # 路径辅助
@@ -160,6 +165,82 @@ def apply_pre_adj(kline: pd.DataFrame, adj: Optional[pd.DataFrame]) -> pd.DataFr
     for col in ("open", "high", "low", "close"):
         out[col] = (out["adj_a"] * merged[col] + merged["adj_b"]).round(4)
     return out.drop(columns=["adj_a", "adj_b"])
+
+
+# =============================================================================
+# 批量模式：从 trade.csv 一行还原成 TARGET_TRADE 同款字典
+# =============================================================================
+
+def _csv_text(row: Dict[str, str], key: str) -> str:
+    return str(row.get(key, "") or "").strip()
+
+
+def _csv_bool(row: Dict[str, str], key: str) -> bool:
+    return _csv_text(row, key).lower() == "true"
+
+
+def _csv_float(row: Dict[str, str], key: str, default: float = 0.0) -> float:
+    text = _csv_text(row, key)
+    if not text:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def _csv_int(row: Dict[str, str], key: str, default: int = 0) -> int:
+    f = _csv_float(row, key, float(default))
+    try:
+        return int(round(f))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_count_dates(row: Dict[str, str]) -> Dict[int, str]:
+    """从 trade.csv 一行抽取 count_1_at ... count_13_at，输出 {n: 'YYYY-MM-DD'}。"""
+    out: Dict[int, str] = {}
+    for n in range(1, 14):
+        text = _csv_text(row, f"count_{n}_at")
+        if text:
+            out[n] = text[:10]
+    return out
+
+
+def trade_dict_from_csv_row(row: Dict[str, str]) -> Optional[Dict[str, object]]:
+    """
+    把 trade.csv 的一行转换为 plot_trade 需要的 TARGET_TRADE 同款字典。
+    只对"已成功买入且已平仓"的行返回；其他（CANCEL / 未成交）返回 None。
+    """
+    if not _csv_bool(row, "bought"):
+        return None
+    if not _csv_text(row, "sell_date") or not _csv_text(row, "buy_date"):
+        return None
+    count_dates = parse_count_dates(row)
+    if not count_dates:
+        return None
+    return {
+        "security": _csv_text(row, "security"),
+        "setup_completed_at": _csv_text(row, "setup_completed_at")[:10],
+        "setup_is_perfect": _csv_bool(row, "setup_is_perfect"),
+        "setup_highest_high": _csv_float(row, "setup_highest_high"),
+        "count_dates": count_dates,
+        "count_8_close": _csv_float(row, "count_8_close"),
+        "countdown_is_perfect": _csv_bool(row, "countdown_is_perfect"),
+        "countdown_status": _csv_text(row, "countdown_status") or "NORMAL",
+        "buy_date": _csv_text(row, "buy_date")[:10],
+        "buy_price": _csv_float(row, "buy_price"),
+        "buy_quantity": _csv_int(row, "buy_quantity"),
+        "buy_commission": _csv_float(row, "buy_commission"),
+        "entry_value": _csv_float(row, "entry_value"),
+        "stop_loss_price": _csv_float(row, "stop_loss_price"),
+        "take_profit_price": _csv_float(row, "take_profit_price"),
+        "sell_date": _csv_text(row, "sell_date")[:10],
+        "sell_price": _csv_float(row, "sell_price"),
+        "sell_commission": _csv_float(row, "sell_commission"),
+        "sell_reason": _csv_text(row, "sell_reason"),
+        "pnl": _csv_float(row, "pnl"),
+    }
 
 
 # =============================================================================
@@ -455,18 +536,25 @@ def diagnose_take_profit(bars: pd.DataFrame, roles: List[str],
               "（即 stop_loss > buy_price，让 take_profit 落到 buy_price 下方）。")
 
 
-def main():
-    trade = TARGET_TRADE
+def _resolve_kline(cache: Dict[str, "pd.DataFrame"], security: str) -> "pd.DataFrame":
+    """同标的多笔交易时共享同一份 K 线缓存，避免重复读 parquet + 复权计算。"""
+    if security not in cache:
+        raw = load_kline(security)
+        adj = load_pre_adj_factors(security) if APPLY_PRE_ADJ else None
+        cache[security] = apply_pre_adj(raw, adj)
+    return cache[security]
+
+
+def run_single(trade: Dict[str, object]) -> None:
+    """单笔模式：保留原有的『打印 K 线明细 + 诊断 + 出图』完整输出。"""
     security = str(trade["security"])
     print(f"加载 K 线: {security}")
-    kline_raw = load_kline(security)
-    adj = load_pre_adj_factors(security) if APPLY_PRE_ADJ else None
-    kline = apply_pre_adj(kline_raw, adj)
+    cache: Dict[str, "pd.DataFrame"] = {}
+    kline = _resolve_kline(cache, security)
     print(f"K 线区间: {kline.index.min().date()} ~ {kline.index.max().date()}  共 {len(kline)} 条")
 
     bars, roles = build_bar_sequence(kline, trade)
 
-    # 控制台打印一份 K 线明细，方便后续做精细对账
     pd.set_option("display.precision", 4)
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 160)
@@ -482,6 +570,65 @@ def main():
     sell_d = str(trade["sell_date"]).replace(" ", "_").replace(":", "")[:10]
     output_path = output_dir / f"{security.replace('.', '')}_{sell_d}.png"
     plot_trade(bars, roles, trade, output_path)
+
+
+def run_batch(csv_path: Path) -> None:
+    """
+    批量模式：读 trade.csv → 对每条已平仓行各画一张图。
+    控制台只打印一行/笔的总结；同标的多笔共享 K 线缓存；单条失败不影响其他条。
+    """
+    import csv as csv_mod
+    if not csv_path.exists():
+        raise FileNotFoundError(f"找不到 trade.csv: {csv_path}")
+    print(f"批量模式: {csv_path}")
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv_mod.DictReader(f))
+    print(f"trade.csv 行数: {len(rows)}")
+
+    output_dir = script_dir() / OUTPUT_DIR_NAME
+    cache: Dict[str, "pd.DataFrame"] = {}
+
+    rendered = 0
+    skipped_unclosed = 0
+    errors: List[Tuple[str, str]] = []
+
+    for idx, row in enumerate(rows, 1):
+        trade = trade_dict_from_csv_row(row)
+        if trade is None:
+            skipped_unclosed += 1
+            continue
+        security = str(trade["security"])
+        sell_d = str(trade["sell_date"])[:10]
+        tag = f"{security} buy={trade['buy_date']} sell={sell_d} reason={trade['sell_reason']}"
+        try:
+            kline = _resolve_kline(cache, security)
+            bars, roles = build_bar_sequence(kline, trade)
+            output_path = output_dir / f"{security.replace('.', '')}_{sell_d}.png"
+            plot_trade(bars, roles, trade, output_path)
+            rendered += 1
+            print(f"  [{rendered:02d}] {tag} -> {output_path.name}")
+        except Exception as e:
+            errors.append((tag, str(e)))
+            print(f"  [ERR] {tag}: {e}")
+
+    print()
+    print(f"完成: rendered={rendered}, skipped(未平仓/未成交)={skipped_unclosed}, errors={len(errors)}")
+    if errors:
+        print("失败明细:")
+        for tag, err in errors:
+            print(f"  - {tag}  ::  {err}")
+    print(f"图表目录: {output_dir}")
+
+
+def main():
+    csv_rel = (BATCH_TRADE_CSV or "").strip()
+    if csv_rel:
+        csv_path = Path(csv_rel)
+        if not csv_path.is_absolute():
+            csv_path = (script_dir() / csv_rel).resolve()
+        run_batch(csv_path)
+        return
+    run_single(TARGET_TRADE)
 
 
 if __name__ == "__main__":
